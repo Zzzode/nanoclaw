@@ -7,7 +7,7 @@ import {
   ExecutionStartedCallback,
 } from './agent-backend.js';
 import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
-import { writeTasksSnapshot } from './container-runner.js';
+import { writeTasksSnapshotToIpc } from './container-snapshot-writer.js';
 import {
   getAllTasks,
   getDueTasks,
@@ -24,6 +24,7 @@ import {
   failExecution,
   heartbeatExecution,
 } from './execution-state.js';
+import { buildTaskSnapshots } from './execution-snapshots.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
@@ -133,22 +134,10 @@ async function runTask(
     return;
   }
 
-  // Update tasks snapshot for container to read (filtered by group)
   const isMain = group.isMain === true;
-  const tasks = getAllTasks();
-  writeTasksSnapshot(
+  writeTasksSnapshotToIpc(
     task.group_folder,
-    isMain,
-    tasks.map((t) => ({
-      id: t.id,
-      groupFolder: t.group_folder,
-      prompt: t.prompt,
-      script: t.script,
-      schedule_type: t.schedule_type,
-      schedule_value: t.schedule_value,
-      status: t.status,
-      next_run: t.next_run,
-    })),
+    buildTaskSnapshots(getAllTasks(), task.group_folder, isMain),
   );
 
   let result: string | null = null;

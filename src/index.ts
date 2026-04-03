@@ -21,7 +21,10 @@ import {
   getChannelFactory,
   getRegisteredChannelNames,
 } from './channels/registry.js';
-import { writeGroupsSnapshot, writeTasksSnapshot } from './container-runner.js';
+import {
+  writeGroupsSnapshotToIpc,
+  writeTasksSnapshotToIpc,
+} from './container-snapshot-writer.js';
 import {
   cleanupOrphans,
   ensureContainerRuntimeRunning,
@@ -50,6 +53,11 @@ import {
   failExecution,
   heartbeatExecution,
 } from './execution-state.js';
+import {
+  buildGroupsSnapshotPayload,
+  buildTaskSnapshots,
+  type GroupSnapshot,
+} from './execution-snapshots.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
@@ -197,7 +205,7 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
  * Get available groups list for the agent.
  * Returns groups ordered by most recent activity.
  */
-export function getAvailableGroups(): import('./container-runner.js').AvailableGroup[] {
+export function getAvailableGroups(): GroupSnapshot[] {
   const chats = getAllChats();
   const registeredJids = new Set(Object.keys(registeredGroups));
 
@@ -349,30 +357,13 @@ async function runAgent(
   const isMain = group.isMain === true;
   const sessionId = sessions[group.folder];
 
-  // Update tasks snapshot for container to read (filtered by group)
-  const tasks = getAllTasks();
-  writeTasksSnapshot(
-    group.folder,
-    isMain,
-    tasks.map((t) => ({
-      id: t.id,
-      groupFolder: t.group_folder,
-      prompt: t.prompt,
-      script: t.script || undefined,
-      schedule_type: t.schedule_type,
-      schedule_value: t.schedule_value,
-      status: t.status,
-      next_run: t.next_run,
-    })),
-  );
+  const taskSnapshots = buildTaskSnapshots(getAllTasks(), group.folder, isMain);
+  writeTasksSnapshotToIpc(group.folder, taskSnapshots);
 
-  // Update available groups snapshot (main group only can see all groups)
   const availableGroups = getAvailableGroups();
-  writeGroupsSnapshot(
+  writeGroupsSnapshotToIpc(
     group.folder,
-    isMain,
-    availableGroups,
-    new Set(Object.keys(registeredGroups)),
+    buildGroupsSnapshotPayload(availableGroups, isMain),
   );
 
   let executionId: string | null = null;
@@ -762,22 +753,14 @@ async function main(): Promise<void> {
       );
     },
     getAvailableGroups,
-    writeGroupsSnapshot: (gf, im, ag, rj) =>
-      writeGroupsSnapshot(gf, im, ag, rj),
+    writeGroupsSnapshot: writeGroupsSnapshotToIpc,
     onTasksChanged: () => {
       const tasks = getAllTasks();
-      const taskRows = tasks.map((t) => ({
-        id: t.id,
-        groupFolder: t.group_folder,
-        prompt: t.prompt,
-        script: t.script || undefined,
-        schedule_type: t.schedule_type,
-        schedule_value: t.schedule_value,
-        status: t.status,
-        next_run: t.next_run,
-      }));
       for (const group of Object.values(registeredGroups)) {
-        writeTasksSnapshot(group.folder, group.isMain === true, taskRows);
+        writeTasksSnapshotToIpc(
+          group.folder,
+          buildTaskSnapshots(tasks, group.folder, group.isMain === true),
+        );
       }
     },
   });

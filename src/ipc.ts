@@ -4,8 +4,12 @@ import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
 
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
-import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import {
+  buildGroupsSnapshotPayload,
+  type GroupSnapshot,
+  type GroupsSnapshotPayload,
+} from './execution-snapshots.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
@@ -15,12 +19,10 @@ export interface IpcDeps {
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
-  getAvailableGroups: () => AvailableGroup[];
+  getAvailableGroups: () => GroupSnapshot[];
   writeGroupsSnapshot: (
     groupFolder: string,
-    isMain: boolean,
-    availableGroups: AvailableGroup[],
-    registeredJids: Set<string>,
+    payload: GroupsSnapshotPayload,
   ) => void;
   onTasksChanged: () => void;
 }
@@ -412,9 +414,7 @@ export async function processTaskIpc(
         const availableGroups = deps.getAvailableGroups();
         deps.writeGroupsSnapshot(
           sourceGroup,
-          true,
-          availableGroups,
-          new Set(Object.keys(registeredGroups)),
+          buildGroupsSnapshotPayload(availableGroups, true),
         );
       } else {
         logger.warn(
