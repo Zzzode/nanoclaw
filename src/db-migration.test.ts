@@ -64,4 +64,51 @@ describe('database migrations', () => {
       process.chdir(repoRoot);
     }
   });
+  it('backfills logical sessions from legacy session rows', async () => {
+    const repoRoot = process.cwd();
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-db-test-'));
+
+    try {
+      process.chdir(tempDir);
+      fs.mkdirSync(path.join(tempDir, 'store'), { recursive: true });
+
+      const dbPath = path.join(tempDir, 'store', 'messages.db');
+      const legacyDb = new Database(dbPath);
+      legacyDb.exec(
+        [
+          'CREATE TABLE sessions (',
+          '  group_folder TEXT PRIMARY KEY,',
+          '  session_id TEXT NOT NULL',
+          ');',
+        ].join('\n'),
+      );
+      legacyDb
+        .prepare(
+          'INSERT INTO sessions (group_folder, session_id) VALUES (?, ?)',
+        )
+        .run('team_alpha', 'session-123');
+      legacyDb.close();
+
+      vi.resetModules();
+      const {
+        _closeDatabase,
+        getAllSessions,
+        getLogicalSession,
+        initDatabase,
+      } = await import('./db.js');
+
+      initDatabase();
+
+      expect(getAllSessions()).toEqual({ team_alpha: 'session-123' });
+      expect(getLogicalSession('group', 'team_alpha')).toMatchObject({
+        id: 'group:team_alpha',
+        providerSessionId: 'session-123',
+        status: 'active',
+      });
+
+      _closeDatabase();
+    } finally {
+      process.chdir(repoRoot);
+    }
+  });
 });

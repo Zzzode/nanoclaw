@@ -2,17 +2,30 @@ import { describe, it, expect, beforeEach } from 'vitest';
 
 import {
   _initTestDatabase,
+  buildLogicalSessionId,
+  createExecutionState,
+  createLogicalSession,
   createTask,
+  deleteSession,
   deleteTask,
   getAllChats,
   getAllRegisteredGroups,
+  getAllSessions,
+  getExecutionState,
   getLastBotMessageTimestamp,
+  getLogicalSession,
   getMessagesSince,
   getNewMessages,
+  getSession,
   getTaskById,
+  listExecutionStates,
+  listLogicalSessions,
   setRegisteredGroup,
+  setSession,
   storeChatMetadata,
   storeMessage,
+  updateExecutionState,
+  updateLogicalSession,
   updateTask,
 } from './db.js';
 import { formatMessages } from './router.js';
@@ -568,5 +581,119 @@ describe('registered group isMain', () => {
     const group = groups['group@g.us'];
     expect(group).toBeDefined();
     expect(group.isMain).toBeUndefined();
+  });
+});
+
+describe('logical session accessors', () => {
+  it('creates, lists, and updates logical sessions', () => {
+    const logicalSessionId = buildLogicalSessionId('task', 'task-1');
+
+    createLogicalSession({
+      id: logicalSessionId,
+      scopeType: 'task',
+      scopeId: 'task-1',
+      providerSessionId: null,
+      status: 'active',
+      lastTurnId: null,
+      workspaceVersion: null,
+      groupMemoryVersion: null,
+      summaryRef: null,
+      recentMessagesWindow: null,
+      createdAt: '2026-04-03T00:00:00.000Z',
+      updatedAt: '2026-04-03T00:00:00.000Z',
+    });
+
+    updateLogicalSession(logicalSessionId, {
+      lastTurnId: 'turn-1',
+      providerSessionId: 'provider-session-1',
+      updatedAt: '2026-04-03T00:00:01.000Z',
+    });
+
+    expect(getLogicalSession('task', 'task-1')).toMatchObject({
+      id: logicalSessionId,
+      lastTurnId: 'turn-1',
+      providerSessionId: 'provider-session-1',
+      status: 'active',
+    });
+    expect(listLogicalSessions('task')).toHaveLength(1);
+  });
+});
+
+describe('execution state accessors', () => {
+  it('creates, lists, and updates execution records', () => {
+    const logicalSessionId = buildLogicalSessionId('group', 'main');
+    createLogicalSession({
+      id: logicalSessionId,
+      scopeType: 'group',
+      scopeId: 'main',
+      providerSessionId: 'provider-session-1',
+      status: 'active',
+      lastTurnId: null,
+      workspaceVersion: null,
+      groupMemoryVersion: null,
+      summaryRef: null,
+      recentMessagesWindow: null,
+      createdAt: '2026-04-03T00:00:00.000Z',
+      updatedAt: '2026-04-03T00:00:00.000Z',
+    });
+
+    createExecutionState({
+      executionId: 'exec-1',
+      logicalSessionId,
+      turnId: 'turn-1',
+      groupJid: 'main@g.us',
+      taskId: null,
+      backend: 'container',
+      edgeNodeId: null,
+      baseWorkspaceVersion: null,
+      leaseUntil: '2026-04-03T00:30:00.000Z',
+      status: 'running',
+      lastHeartbeatAt: null,
+      cancelRequestedAt: null,
+      committedAt: null,
+      finishedAt: null,
+      error: null,
+      createdAt: '2026-04-03T00:00:00.000Z',
+      updatedAt: '2026-04-03T00:00:00.000Z',
+    });
+
+    updateExecutionState('exec-1', {
+      error: 'boom',
+      finishedAt: '2026-04-03T00:00:02.000Z',
+      status: 'failed',
+      updatedAt: '2026-04-03T00:00:02.000Z',
+    });
+
+    expect(getExecutionState('exec-1')).toMatchObject({
+      executionId: 'exec-1',
+      error: 'boom',
+      logicalSessionId,
+      status: 'failed',
+    });
+    expect(listExecutionStates('failed')).toHaveLength(1);
+  });
+});
+
+describe('session compatibility mapping', () => {
+  it('writes through setSession and deleteSession into logical session compatibility state', () => {
+    setSession('team_alpha', 'session-1');
+
+    expect(getSession('team_alpha')).toBe('session-1');
+    expect(getAllSessions()).toEqual({ team_alpha: 'session-1' });
+    expect(getLogicalSession('group', 'team_alpha')).toMatchObject({
+      id: 'group:team_alpha',
+      providerSessionId: 'session-1',
+      status: 'active',
+    });
+
+    deleteSession('team_alpha');
+
+    expect(getSession('team_alpha')).toBeUndefined();
+    expect(getAllSessions()).toEqual({});
+    expect(getLogicalSession('group', 'team_alpha')).toMatchObject({
+      id: 'group:team_alpha',
+      providerSessionId: null,
+      status: 'stale',
+    });
   });
 });

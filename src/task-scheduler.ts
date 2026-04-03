@@ -13,9 +13,17 @@ import {
   getDueTasks,
   getTaskById,
   logTaskRun,
+  setSession,
   updateTask,
   updateTaskAfterRun,
 } from './db.js';
+import {
+  beginExecution,
+  commitExecution,
+  completeExecution,
+  failExecution,
+  heartbeatExecution,
+} from './execution-state.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
@@ -145,11 +153,16 @@ async function runTask(
 
   let result: string | null = null;
   let error: string | null = null;
+  let executionId: string | null = null;
+  let streamedError: string | null = null;
 
-  // For group context mode, use the group's current session
+  // Keep current behavior: only group-context tasks resume the group's
+  // provider session; isolated tasks still execute as single-turn runs.
   const sessions = deps.getSessions();
   const sessionId =
     task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
+  const scopeType = task.context_mode === 'group' ? 'group' : 'task';
+  const scopeId = task.context_mode === 'group' ? task.group_folder : task.id;
 
   // After the task produces a result, close the container promptly.
   // Tasks are single-turn — no need to wait IDLE_TIMEOUT (30 min) for the
@@ -166,6 +179,15 @@ async function runTask(
   };
 
   try {
+    const execution = beginExecution({
+      scopeType,
+      scopeId,
+      backend: 'container',
+      groupJid: task.chat_jid,
+      taskId: task.id,
+    });
+    executionId = execution.executionId;
+
     const output = await deps.backend.run(
       group,
       {
@@ -180,6 +202,14 @@ async function runTask(
       },
       deps.onExecutionStarted,
       async (streamedOutput: AgentRunOutput) => {
+        if (executionId) heartbeatExecution(executionId);
+        if (task.context_mode === 'group' && streamedOutput.newSessionId) {
+          sessions[task.group_folder] = streamedOutput.newSessionId;
+          setSession(task.group_folder, streamedOutput.newSessionId);
+        }
+        if (streamedOutput.status === 'error') {
+          streamedError = streamedOutput.error || 'Unknown error';
+        }
         if (streamedOutput.result) {
           result = streamedOutput.result;
           // Forward result to user (sendMessage handles formatting)
@@ -190,19 +220,29 @@ async function runTask(
           deps.queue.notifyIdle(task.chat_jid);
           scheduleClose(); // Close promptly even when result is null (e.g. IPC-only tasks)
         }
-        if (streamedOutput.status === 'error') {
-          error = streamedOutput.error || 'Unknown error';
-        }
       },
     );
 
     if (closeTimer) clearTimeout(closeTimer);
 
+    if (task.context_mode === 'group' && output.newSessionId) {
+      sessions[task.group_folder] = output.newSessionId;
+      setSession(task.group_folder, output.newSessionId);
+    }
+
+    error = streamedError || output.error || error;
     if (output.status === 'error') {
-      error = output.error || 'Unknown error';
+      error = error || 'Unknown error';
     } else if (output.result) {
       // Result was already forwarded to the user via the streaming callback above
       result = output.result;
+    }
+
+    if (error) {
+      failExecution(executionId, error);
+    } else {
+      commitExecution(executionId);
+      completeExecution(executionId);
     }
 
     logger.info(
@@ -212,6 +252,9 @@ async function runTask(
   } catch (err) {
     if (closeTimer) clearTimeout(closeTimer);
     error = err instanceof Error ? err.message : String(err);
+    if (executionId) {
+      failExecution(executionId, error);
+    }
     logger.error({ taskId: task.id, error }, 'Task failed');
   }
 
@@ -234,7 +277,6 @@ async function runTask(
       : 'Completed';
   updateTaskAfterRun(task.id, nextRun, resultSummary);
 }
-
 let schedulerRunning = false;
 
 export function startSchedulerLoop(deps: SchedulerDependencies): void {

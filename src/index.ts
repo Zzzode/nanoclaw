@@ -21,10 +21,7 @@ import {
   getChannelFactory,
   getRegisteredChannelNames,
 } from './channels/registry.js';
-import {
-  writeGroupsSnapshot,
-  writeTasksSnapshot,
-} from './container-runner.js';
+import { writeGroupsSnapshot, writeTasksSnapshot } from './container-runner.js';
 import {
   cleanupOrphans,
   ensureContainerRuntimeRunning,
@@ -46,6 +43,13 @@ import {
   storeChatMetadata,
   storeMessage,
 } from './db.js';
+import {
+  beginExecution,
+  commitExecution,
+  completeExecution,
+  failExecution,
+  heartbeatExecution,
+} from './execution-state.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
@@ -371,18 +375,33 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
-  // Wrap onOutput to track session ID from streamed results
-  const wrappedOnOutput = onOutput
-    ? async (output: AgentRunOutput) => {
-        if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
-        }
-        await onOutput(output);
-      }
-    : undefined;
+  let executionId: string | null = null;
+  let streamedError: string | null = null;
 
   try {
+    const execution = beginExecution({
+      scopeType: 'group',
+      scopeId: group.folder,
+      backend: 'container',
+      groupJid: chatJid,
+    });
+    executionId = execution.executionId;
+
+    // Always stream through the wrapper so execution heartbeats and
+    // session compatibility updates happen even when the caller does not
+    // need per-chunk output handling.
+    const wrappedOnOutput = async (output: AgentRunOutput) => {
+      if (output.newSessionId) {
+        sessions[group.folder] = output.newSessionId;
+        setSession(group.folder, output.newSessionId);
+      }
+      if (executionId) heartbeatExecution(executionId);
+      if (output.status === 'error') {
+        streamedError = output.error || 'Unknown error';
+      }
+      await onOutput?.(output);
+    };
+
     const output = await agentBackend.run(
       group,
       {
@@ -408,41 +427,45 @@ async function runAgent(
       setSession(group.folder, output.newSessionId);
     }
 
-    if (output.status === 'error') {
+    const error = streamedError || output.error;
+    if (output.status === 'error' || error) {
       // Detect stale/corrupt session — clear it so the next retry starts fresh.
       // The session .jsonl can go missing after a crash mid-write, manual
       // deletion, or disk-full. The existing backoff in group-queue.ts
       // handles the retry; we just need to remove the broken session ID.
       const isStaleSession =
         sessionId &&
-        output.error &&
-        /no conversation found|ENOENT.*\.jsonl|session.*not found/i.test(
-          output.error,
-        );
+        error &&
+        /no conversation found|ENOENT.*\.jsonl|session.*not found/i.test(error);
 
       if (isStaleSession) {
         logger.warn(
-          { group: group.name, staleSessionId: sessionId, error: output.error },
+          { group: group.name, staleSessionId: sessionId, error },
           'Stale session detected — clearing for next retry',
         );
         delete sessions[group.folder];
         deleteSession(group.folder);
       }
 
-      logger.error(
-        { group: group.name, error: output.error },
-        'Container agent error',
-      );
+      failExecution(executionId, error || 'Unknown error');
+      logger.error({ group: group.name, error }, 'Container agent error');
       return 'error';
     }
 
+    commitExecution(executionId);
+    completeExecution(executionId);
     return 'success';
   } catch (err) {
+    if (executionId) {
+      failExecution(
+        executionId,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
     logger.error({ group: group.name, err }, 'Agent error');
     return 'error';
   }
 }
-
 async function startMessageLoop(): Promise<void> {
   if (messageLoopRunning) {
     logger.debug('Message loop already running, skipping duplicate start');

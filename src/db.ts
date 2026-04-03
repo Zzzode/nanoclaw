@@ -14,6 +14,97 @@ import {
 
 let db: Database.Database;
 
+export type LogicalSessionScopeType = 'group' | 'task';
+export type LogicalSessionStatus = 'active' | 'stale' | 'closed';
+export type ExecutionStatus =
+  | 'running'
+  | 'cancel_requested'
+  | 'committed'
+  | 'completed'
+  | 'failed'
+  | 'lost';
+
+export interface LogicalSessionRecord {
+  id: string;
+  scopeType: LogicalSessionScopeType;
+  scopeId: string;
+  providerSessionId: string | null;
+  status: LogicalSessionStatus;
+  lastTurnId: string | null;
+  workspaceVersion: string | null;
+  groupMemoryVersion: string | null;
+  summaryRef: string | null;
+  recentMessagesWindow: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ExecutionStateRecord {
+  executionId: string;
+  logicalSessionId: string;
+  turnId: string;
+  groupJid: string | null;
+  taskId: string | null;
+  backend: string;
+  edgeNodeId: string | null;
+  baseWorkspaceVersion: string | null;
+  leaseUntil: string;
+  status: ExecutionStatus;
+  lastHeartbeatAt: string | null;
+  cancelRequestedAt: string | null;
+  committedAt: string | null;
+  finishedAt: string | null;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export function buildLogicalSessionId(
+  scopeType: LogicalSessionScopeType,
+  scopeId: string,
+): string {
+  return `${scopeType}:${scopeId}`;
+}
+
+const LOGICAL_SESSION_SELECT = `
+  SELECT
+    id,
+    scope_type AS scopeType,
+    scope_id AS scopeId,
+    provider_session_id AS providerSessionId,
+    status,
+    last_turn_id AS lastTurnId,
+    workspace_version AS workspaceVersion,
+    group_memory_version AS groupMemoryVersion,
+    summary_ref AS summaryRef,
+    recent_messages_window AS recentMessagesWindow,
+    created_at AS createdAt,
+    updated_at AS updatedAt
+  FROM logical_sessions
+`;
+
+const EXECUTION_STATE_SELECT = `
+  SELECT
+    execution_id AS executionId,
+    logical_session_id AS logicalSessionId,
+    turn_id AS turnId,
+    group_jid AS groupJid,
+    task_id AS taskId,
+    backend,
+    edge_node_id AS edgeNodeId,
+    base_workspace_version AS baseWorkspaceVersion,
+    lease_until AS leaseUntil,
+    status,
+    last_heartbeat_at AS lastHeartbeatAt,
+    cancel_requested_at AS cancelRequestedAt,
+    committed_at AS committedAt,
+    finished_at AS finishedAt,
+    error,
+    created_at AS createdAt,
+    updated_at AS updatedAt
+  FROM execution_state
+`;
+
 function createSchema(database: Database.Database): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS chats (
@@ -73,6 +164,51 @@ function createSchema(database: Database.Database): void {
       group_folder TEXT PRIMARY KEY,
       session_id TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS logical_sessions (
+      id TEXT PRIMARY KEY,
+      scope_type TEXT NOT NULL,
+      scope_id TEXT NOT NULL,
+      provider_session_id TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
+      last_turn_id TEXT,
+      workspace_version TEXT,
+      group_memory_version TEXT,
+      summary_ref TEXT,
+      recent_messages_window TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE (scope_type, scope_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_logical_sessions_scope
+      ON logical_sessions(scope_type, scope_id);
+
+    CREATE TABLE IF NOT EXISTS execution_state (
+      execution_id TEXT PRIMARY KEY,
+      logical_session_id TEXT NOT NULL,
+      turn_id TEXT NOT NULL,
+      group_jid TEXT,
+      task_id TEXT,
+      backend TEXT NOT NULL,
+      edge_node_id TEXT,
+      base_workspace_version TEXT,
+      lease_until TEXT NOT NULL,
+      status TEXT NOT NULL,
+      last_heartbeat_at TEXT,
+      cancel_requested_at TEXT,
+      committed_at TEXT,
+      finished_at TEXT,
+      error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (logical_session_id) REFERENCES logical_sessions(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_execution_state_status
+      ON execution_state(status);
+    CREATE INDEX IF NOT EXISTS idx_execution_state_lease
+      ON execution_state(lease_until);
+    CREATE INDEX IF NOT EXISTS idx_execution_state_session
+      ON execution_state(logical_session_id);
+
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -146,6 +282,82 @@ function createSchema(database: Database.Database): void {
   } catch {
     /* columns already exist */
   }
+
+  database.exec(`
+    INSERT OR IGNORE INTO logical_sessions (
+      id,
+      scope_type,
+      scope_id,
+      provider_session_id,
+      status,
+      created_at,
+      updated_at
+    )
+    SELECT
+      'group:' || group_folder,
+      'group',
+      group_folder,
+      session_id,
+      'active',
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    FROM sessions;
+
+    UPDATE logical_sessions
+    SET
+      provider_session_id = (
+        SELECT session_id
+        FROM sessions
+        WHERE sessions.group_folder = logical_sessions.scope_id
+      ),
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE scope_type = 'group'
+      AND provider_session_id IS NULL
+      AND EXISTS (
+        SELECT 1
+        FROM sessions
+        WHERE sessions.group_folder = logical_sessions.scope_id
+      );
+  `);
+}
+
+function mapLogicalSessionRow(row: {
+  id: string;
+  scopeType: LogicalSessionScopeType;
+  scopeId: string;
+  providerSessionId: string | null;
+  status: LogicalSessionStatus;
+  lastTurnId: string | null;
+  workspaceVersion: string | null;
+  groupMemoryVersion: string | null;
+  summaryRef: string | null;
+  recentMessagesWindow: string | null;
+  createdAt: string;
+  updatedAt: string;
+}): LogicalSessionRecord {
+  return row;
+}
+
+function mapExecutionStateRow(row: {
+  executionId: string;
+  logicalSessionId: string;
+  turnId: string;
+  groupJid: string | null;
+  taskId: string | null;
+  backend: string;
+  edgeNodeId: string | null;
+  baseWorkspaceVersion: string | null;
+  leaseUntil: string;
+  status: ExecutionStatus;
+  lastHeartbeatAt: string | null;
+  cancelRequestedAt: string | null;
+  committedAt: string | null;
+  finishedAt: string | null;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+}): ExecutionStateRecord {
+  return row;
 }
 
 export function initDatabase(): void {
@@ -546,9 +758,401 @@ export function setRouterState(key: string, value: string): void {
   ).run(key, value);
 }
 
+// --- Logical session accessors ---
+
+export function getLogicalSession(
+  scopeType: LogicalSessionScopeType,
+  scopeId: string,
+): LogicalSessionRecord | undefined {
+  const row = db
+    .prepare(`${LOGICAL_SESSION_SELECT} WHERE scope_type = ? AND scope_id = ?`)
+    .get(scopeType, scopeId) as
+    | {
+        id: string;
+        scopeType: LogicalSessionScopeType;
+        scopeId: string;
+        providerSessionId: string | null;
+        status: LogicalSessionStatus;
+        lastTurnId: string | null;
+        workspaceVersion: string | null;
+        groupMemoryVersion: string | null;
+        summaryRef: string | null;
+        recentMessagesWindow: string | null;
+        createdAt: string;
+        updatedAt: string;
+      }
+    | undefined;
+  return row ? mapLogicalSessionRow(row) : undefined;
+}
+
+export function getLogicalSessionById(
+  id: string,
+): LogicalSessionRecord | undefined {
+  const row = db.prepare(`${LOGICAL_SESSION_SELECT} WHERE id = ?`).get(id) as
+    | {
+        id: string;
+        scopeType: LogicalSessionScopeType;
+        scopeId: string;
+        providerSessionId: string | null;
+        status: LogicalSessionStatus;
+        lastTurnId: string | null;
+        workspaceVersion: string | null;
+        groupMemoryVersion: string | null;
+        summaryRef: string | null;
+        recentMessagesWindow: string | null;
+        createdAt: string;
+        updatedAt: string;
+      }
+    | undefined;
+  return row ? mapLogicalSessionRow(row) : undefined;
+}
+
+export function listLogicalSessions(
+  scopeType?: LogicalSessionScopeType,
+): LogicalSessionRecord[] {
+  const rows = scopeType
+    ? (db
+        .prepare(
+          `${LOGICAL_SESSION_SELECT} WHERE scope_type = ? ORDER BY created_at ASC`,
+        )
+        .all(scopeType) as Array<{
+        id: string;
+        scopeType: LogicalSessionScopeType;
+        scopeId: string;
+        providerSessionId: string | null;
+        status: LogicalSessionStatus;
+        lastTurnId: string | null;
+        workspaceVersion: string | null;
+        groupMemoryVersion: string | null;
+        summaryRef: string | null;
+        recentMessagesWindow: string | null;
+        createdAt: string;
+        updatedAt: string;
+      }>)
+    : (db
+        .prepare(`${LOGICAL_SESSION_SELECT} ORDER BY created_at ASC`)
+        .all() as Array<{
+        id: string;
+        scopeType: LogicalSessionScopeType;
+        scopeId: string;
+        providerSessionId: string | null;
+        status: LogicalSessionStatus;
+        lastTurnId: string | null;
+        workspaceVersion: string | null;
+        groupMemoryVersion: string | null;
+        summaryRef: string | null;
+        recentMessagesWindow: string | null;
+        createdAt: string;
+        updatedAt: string;
+      }>);
+  return rows.map(mapLogicalSessionRow);
+}
+
+export function createLogicalSession(session: LogicalSessionRecord): void {
+  db.prepare(
+    `
+      INSERT INTO logical_sessions (
+        id,
+        scope_type,
+        scope_id,
+        provider_session_id,
+        status,
+        last_turn_id,
+        workspace_version,
+        group_memory_version,
+        summary_ref,
+        recent_messages_window,
+        created_at,
+        updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `,
+  ).run(
+    session.id,
+    session.scopeType,
+    session.scopeId,
+    session.providerSessionId,
+    session.status,
+    session.lastTurnId,
+    session.workspaceVersion,
+    session.groupMemoryVersion,
+    session.summaryRef,
+    session.recentMessagesWindow,
+    session.createdAt,
+    session.updatedAt,
+  );
+}
+
+export function updateLogicalSession(
+  id: string,
+  updates: Partial<
+    Pick<
+      LogicalSessionRecord,
+      | 'providerSessionId'
+      | 'status'
+      | 'lastTurnId'
+      | 'workspaceVersion'
+      | 'groupMemoryVersion'
+      | 'summaryRef'
+      | 'recentMessagesWindow'
+      | 'updatedAt'
+    >
+  >,
+): void {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+
+  if (updates.providerSessionId !== undefined) {
+    fields.push('provider_session_id = ?');
+    values.push(updates.providerSessionId);
+  }
+  if (updates.status !== undefined) {
+    fields.push('status = ?');
+    values.push(updates.status);
+  }
+  if (updates.lastTurnId !== undefined) {
+    fields.push('last_turn_id = ?');
+    values.push(updates.lastTurnId);
+  }
+  if (updates.workspaceVersion !== undefined) {
+    fields.push('workspace_version = ?');
+    values.push(updates.workspaceVersion);
+  }
+  if (updates.groupMemoryVersion !== undefined) {
+    fields.push('group_memory_version = ?');
+    values.push(updates.groupMemoryVersion);
+  }
+  if (updates.summaryRef !== undefined) {
+    fields.push('summary_ref = ?');
+    values.push(updates.summaryRef);
+  }
+  if (updates.recentMessagesWindow !== undefined) {
+    fields.push('recent_messages_window = ?');
+    values.push(updates.recentMessagesWindow);
+  }
+  if (updates.updatedAt !== undefined) {
+    fields.push('updated_at = ?');
+    values.push(updates.updatedAt);
+  }
+
+  if (fields.length === 0) return;
+
+  values.push(id);
+  db.prepare(
+    `UPDATE logical_sessions SET ${fields.join(', ')} WHERE id = ?`,
+  ).run(...values);
+}
+
+// --- Execution state accessors ---
+
+export function getExecutionState(
+  executionId: string,
+): ExecutionStateRecord | undefined {
+  const row = db
+    .prepare(`${EXECUTION_STATE_SELECT} WHERE execution_id = ?`)
+    .get(executionId) as
+    | {
+        executionId: string;
+        logicalSessionId: string;
+        turnId: string;
+        groupJid: string | null;
+        taskId: string | null;
+        backend: string;
+        edgeNodeId: string | null;
+        baseWorkspaceVersion: string | null;
+        leaseUntil: string;
+        status: ExecutionStatus;
+        lastHeartbeatAt: string | null;
+        cancelRequestedAt: string | null;
+        committedAt: string | null;
+        finishedAt: string | null;
+        error: string | null;
+        createdAt: string;
+        updatedAt: string;
+      }
+    | undefined;
+  return row ? mapExecutionStateRow(row) : undefined;
+}
+
+export function listExecutionStates(
+  status?: ExecutionStatus,
+): ExecutionStateRecord[] {
+  const rows = status
+    ? (db
+        .prepare(
+          `${EXECUTION_STATE_SELECT} WHERE status = ? ORDER BY created_at ASC`,
+        )
+        .all(status) as Array<{
+        executionId: string;
+        logicalSessionId: string;
+        turnId: string;
+        groupJid: string | null;
+        taskId: string | null;
+        backend: string;
+        edgeNodeId: string | null;
+        baseWorkspaceVersion: string | null;
+        leaseUntil: string;
+        status: ExecutionStatus;
+        lastHeartbeatAt: string | null;
+        cancelRequestedAt: string | null;
+        committedAt: string | null;
+        finishedAt: string | null;
+        error: string | null;
+        createdAt: string;
+        updatedAt: string;
+      }>)
+    : (db
+        .prepare(`${EXECUTION_STATE_SELECT} ORDER BY created_at ASC`)
+        .all() as Array<{
+        executionId: string;
+        logicalSessionId: string;
+        turnId: string;
+        groupJid: string | null;
+        taskId: string | null;
+        backend: string;
+        edgeNodeId: string | null;
+        baseWorkspaceVersion: string | null;
+        leaseUntil: string;
+        status: ExecutionStatus;
+        lastHeartbeatAt: string | null;
+        cancelRequestedAt: string | null;
+        committedAt: string | null;
+        finishedAt: string | null;
+        error: string | null;
+        createdAt: string;
+        updatedAt: string;
+      }>);
+  return rows.map(mapExecutionStateRow);
+}
+
+export function createExecutionState(record: ExecutionStateRecord): void {
+  db.prepare(
+    `
+      INSERT INTO execution_state (
+        execution_id,
+        logical_session_id,
+        turn_id,
+        group_jid,
+        task_id,
+        backend,
+        edge_node_id,
+        base_workspace_version,
+        lease_until,
+        status,
+        last_heartbeat_at,
+        cancel_requested_at,
+        committed_at,
+        finished_at,
+        error,
+        created_at,
+        updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `,
+  ).run(
+    record.executionId,
+    record.logicalSessionId,
+    record.turnId,
+    record.groupJid,
+    record.taskId,
+    record.backend,
+    record.edgeNodeId,
+    record.baseWorkspaceVersion,
+    record.leaseUntil,
+    record.status,
+    record.lastHeartbeatAt,
+    record.cancelRequestedAt,
+    record.committedAt,
+    record.finishedAt,
+    record.error,
+    record.createdAt,
+    record.updatedAt,
+  );
+}
+
+export function updateExecutionState(
+  executionId: string,
+  updates: Partial<
+    Pick<
+      ExecutionStateRecord,
+      | 'backend'
+      | 'edgeNodeId'
+      | 'baseWorkspaceVersion'
+      | 'leaseUntil'
+      | 'status'
+      | 'lastHeartbeatAt'
+      | 'cancelRequestedAt'
+      | 'committedAt'
+      | 'finishedAt'
+      | 'error'
+      | 'updatedAt'
+    >
+  >,
+): void {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+
+  if (updates.backend !== undefined) {
+    fields.push('backend = ?');
+    values.push(updates.backend);
+  }
+  if (updates.edgeNodeId !== undefined) {
+    fields.push('edge_node_id = ?');
+    values.push(updates.edgeNodeId);
+  }
+  if (updates.baseWorkspaceVersion !== undefined) {
+    fields.push('base_workspace_version = ?');
+    values.push(updates.baseWorkspaceVersion);
+  }
+  if (updates.leaseUntil !== undefined) {
+    fields.push('lease_until = ?');
+    values.push(updates.leaseUntil);
+  }
+  if (updates.status !== undefined) {
+    fields.push('status = ?');
+    values.push(updates.status);
+  }
+  if (updates.lastHeartbeatAt !== undefined) {
+    fields.push('last_heartbeat_at = ?');
+    values.push(updates.lastHeartbeatAt);
+  }
+  if (updates.cancelRequestedAt !== undefined) {
+    fields.push('cancel_requested_at = ?');
+    values.push(updates.cancelRequestedAt);
+  }
+  if (updates.committedAt !== undefined) {
+    fields.push('committed_at = ?');
+    values.push(updates.committedAt);
+  }
+  if (updates.finishedAt !== undefined) {
+    fields.push('finished_at = ?');
+    values.push(updates.finishedAt);
+  }
+  if (updates.error !== undefined) {
+    fields.push('error = ?');
+    values.push(updates.error);
+  }
+  if (updates.updatedAt !== undefined) {
+    fields.push('updated_at = ?');
+    values.push(updates.updatedAt);
+  }
+
+  if (fields.length === 0) return;
+
+  values.push(executionId);
+  db.prepare(
+    `UPDATE execution_state SET ${fields.join(', ')} WHERE execution_id = ?`,
+  ).run(...values);
+}
+
 // --- Session accessors ---
 
 export function getSession(groupFolder: string): string | undefined {
+  const logicalSession = getLogicalSession('group', groupFolder);
+  if (logicalSession?.providerSessionId) {
+    return logicalSession.providerSessionId;
+  }
+
   const row = db
     .prepare('SELECT session_id FROM sessions WHERE group_folder = ?')
     .get(groupFolder) as { session_id: string } | undefined;
@@ -556,23 +1160,86 @@ export function getSession(groupFolder: string): string | undefined {
 }
 
 export function setSession(groupFolder: string, sessionId: string): void {
+  const now = new Date().toISOString();
   db.prepare(
     'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
   ).run(groupFolder, sessionId);
+
+  const logicalSessionId = buildLogicalSessionId('group', groupFolder);
+  const existing = getLogicalSessionById(logicalSessionId);
+  if (existing) {
+    updateLogicalSession(logicalSessionId, {
+      providerSessionId: sessionId,
+      status: 'active',
+      updatedAt: now,
+    });
+    return;
+  }
+
+  createLogicalSession({
+    id: logicalSessionId,
+    scopeType: 'group',
+    scopeId: groupFolder,
+    providerSessionId: sessionId,
+    status: 'active',
+    lastTurnId: null,
+    workspaceVersion: null,
+    groupMemoryVersion: null,
+    summaryRef: null,
+    recentMessagesWindow: null,
+    createdAt: now,
+    updatedAt: now,
+  });
 }
 
 export function deleteSession(groupFolder: string): void {
+  const now = new Date().toISOString();
   db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+
+  const logicalSessionId = buildLogicalSessionId('group', groupFolder);
+  const existing = getLogicalSessionById(logicalSessionId);
+  if (existing) {
+    updateLogicalSession(logicalSessionId, {
+      providerSessionId: null,
+      status: 'stale',
+      updatedAt: now,
+    });
+    return;
+  }
+
+  createLogicalSession({
+    id: logicalSessionId,
+    scopeType: 'group',
+    scopeId: groupFolder,
+    providerSessionId: null,
+    status: 'stale',
+    lastTurnId: null,
+    workspaceVersion: null,
+    groupMemoryVersion: null,
+    summaryRef: null,
+    recentMessagesWindow: null,
+    createdAt: now,
+    updatedAt: now,
+  });
 }
 
 export function getAllSessions(): Record<string, string> {
-  const rows = db
+  const result: Record<string, string> = {};
+  for (const session of listLogicalSessions('group')) {
+    if (session.providerSessionId) {
+      result[session.scopeId] = session.providerSessionId;
+    }
+  }
+
+  const legacyRows = db
     .prepare('SELECT group_folder, session_id FROM sessions')
     .all() as Array<{ group_folder: string; session_id: string }>;
-  const result: Record<string, string> = {};
-  for (const row of rows) {
-    result[row.group_folder] = row.session_id;
+  for (const row of legacyRows) {
+    if (!result[row.group_folder]) {
+      result[row.group_folder] = row.session_id;
+    }
   }
+
   return result;
 }
 

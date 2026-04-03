@@ -1,21 +1,29 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AgentBackend } from './agent-backend.js';
-import { _initTestDatabase, createTask, getTaskById } from './db.js';
+import {
+  _initTestDatabase,
+  createTask,
+  getLogicalSession,
+  getTaskById,
+  listExecutionStates,
+} from './db.js';
 import {
   _resetSchedulerLoopForTests,
   computeNextRun,
   startSchedulerLoop,
 } from './task-scheduler.js';
 
+const backendRun = vi.fn();
 const backendStub: AgentBackend = {
-  run: vi.fn(),
+  run: backendRun,
 };
 
 describe('task scheduler', () => {
   beforeEach(() => {
     _initTestDatabase();
     _resetSchedulerLoopForTests();
+    backendRun.mockReset();
     vi.useFakeTimers();
   });
 
@@ -130,5 +138,147 @@ describe('task scheduler', () => {
     const offset =
       (new Date(nextRun!).getTime() - new Date(scheduledTime).getTime()) % ms;
     expect(offset).toBe(0);
+  });
+
+  it('records group-context task executions against the group logical session', async () => {
+    createTask({
+      id: 'task-group-context',
+      group_folder: 'team_alpha',
+      chat_jid: 'room@g.us',
+      prompt: 'summarize the group backlog',
+      schedule_type: 'once',
+      schedule_value: '2026-04-03T00:00:00.000Z',
+      context_mode: 'group',
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-04-03T00:00:00.000Z',
+    });
+
+    backendRun.mockImplementation(async (_group, input, _started, onOutput) => {
+      expect(input.sessionId).toBe('session-group-1');
+      await onOutput?.({
+        newSessionId: 'session-group-2',
+        result: 'scheduled reply',
+        status: 'success',
+      });
+      return {
+        newSessionId: 'session-group-2',
+        result: 'scheduled reply',
+        status: 'success',
+      };
+    });
+
+    const enqueueTask = vi.fn(
+      async (_groupJid: string, _taskId: string, fn: () => Promise<void>) => {
+        await fn();
+      },
+    );
+    const queue = {
+      closeStdin: vi.fn(),
+      enqueueTask,
+      notifyIdle: vi.fn(),
+    } as any;
+    const sendMessage = vi.fn(async () => {});
+
+    startSchedulerLoop({
+      backend: backendStub,
+      registeredGroups: () => ({
+        'room@g.us': {
+          name: 'Team Alpha',
+          folder: 'team_alpha',
+          trigger: '@Andy',
+          added_at: '2026-04-03T00:00:00.000Z',
+        },
+      }),
+      getSessions: () => ({ team_alpha: 'session-group-1' }),
+      queue,
+      sendMessage,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sendMessage).toHaveBeenCalledWith('room@g.us', 'scheduled reply');
+    expect(getLogicalSession('group', 'team_alpha')).toMatchObject({
+      id: 'group:team_alpha',
+      lastTurnId: expect.any(String),
+      providerSessionId: 'session-group-2',
+      status: 'active',
+    });
+
+    const executions = listExecutionStates();
+    expect(executions).toHaveLength(1);
+    expect(executions[0]).toMatchObject({
+      groupJid: 'room@g.us',
+      logicalSessionId: 'group:team_alpha',
+      status: 'completed',
+      taskId: 'task-group-context',
+    });
+  });
+
+  it('records isolated task executions with a dedicated logical session', async () => {
+    createTask({
+      id: 'task-isolated-context',
+      group_folder: 'team_alpha',
+      chat_jid: 'room@g.us',
+      prompt: 'run a private maintenance turn',
+      schedule_type: 'once',
+      schedule_value: '2026-04-03T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-04-03T00:00:00.000Z',
+    });
+
+    backendRun.mockImplementation(async (_group, input, _started, onOutput) => {
+      expect(input.sessionId).toBeUndefined();
+      await onOutput?.({ status: 'success', result: null });
+      return { status: 'success', result: null };
+    });
+
+    const enqueueTask = vi.fn(
+      async (_groupJid: string, _taskId: string, fn: () => Promise<void>) => {
+        await fn();
+      },
+    );
+    const queue = {
+      closeStdin: vi.fn(),
+      enqueueTask,
+      notifyIdle: vi.fn(),
+    } as any;
+    const sendMessage = vi.fn(async () => {});
+
+    startSchedulerLoop({
+      backend: backendStub,
+      registeredGroups: () => ({
+        'room@g.us': {
+          name: 'Team Alpha',
+          folder: 'team_alpha',
+          trigger: '@Andy',
+          added_at: '2026-04-03T00:00:00.000Z',
+        },
+      }),
+      getSessions: () => ({ team_alpha: 'session-group-1' }),
+      queue,
+      sendMessage,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(getLogicalSession('task', 'task-isolated-context')).toMatchObject({
+      id: 'task:task-isolated-context',
+      lastTurnId: expect.any(String),
+      providerSessionId: null,
+      status: 'active',
+    });
+
+    const executions = listExecutionStates();
+    expect(executions).toHaveLength(1);
+    expect(executions[0]).toMatchObject({
+      groupJid: 'room@g.us',
+      logicalSessionId: 'task:task-isolated-context',
+      status: 'completed',
+      taskId: 'task-isolated-context',
+    });
   });
 });
