@@ -15,8 +15,12 @@ import {
 } from './task-scheduler.js';
 
 const backendRun = vi.fn();
+const edgeBackendRun = vi.fn();
 const backendStub: AgentBackend = {
   run: backendRun,
+};
+const edgeBackendStub: AgentBackend = {
+  run: edgeBackendRun,
 };
 
 describe('task scheduler', () => {
@@ -24,6 +28,7 @@ describe('task scheduler', () => {
     _initTestDatabase();
     _resetSchedulerLoopForTests();
     backendRun.mockReset();
+    edgeBackendRun.mockReset();
     vi.useFakeTimers();
   });
 
@@ -52,7 +57,8 @@ describe('task scheduler', () => {
     );
 
     startSchedulerLoop({
-      backend: backendStub,
+      backends: { container: backendStub, edge: edgeBackendStub },
+      defaultExecutionMode: 'container',
       registeredGroups: () => ({}),
       getSessions: () => ({}),
       queue: { enqueueTask } as any,
@@ -181,7 +187,8 @@ describe('task scheduler', () => {
     const sendMessage = vi.fn(async () => {});
 
     startSchedulerLoop({
-      backend: backendStub,
+      backends: { container: backendStub, edge: edgeBackendStub },
+      defaultExecutionMode: 'container',
       registeredGroups: () => ({
         'room@g.us': {
           name: 'Team Alpha',
@@ -248,7 +255,8 @@ describe('task scheduler', () => {
     const sendMessage = vi.fn(async () => {});
 
     startSchedulerLoop({
-      backend: backendStub,
+      backends: { container: backendStub, edge: edgeBackendStub },
+      defaultExecutionMode: 'container',
       registeredGroups: () => ({
         'room@g.us': {
           name: 'Team Alpha',
@@ -280,5 +288,135 @@ describe('task scheduler', () => {
       status: 'completed',
       taskId: 'task-isolated-context',
     });
+  });
+
+  it('routes auto groups without scripts to edge backend', async () => {
+    createTask({
+      id: 'task-edge-auto',
+      group_folder: 'team_alpha',
+      chat_jid: 'room@g.us',
+      prompt: 'edge task',
+      schedule_type: 'once',
+      schedule_value: '2026-04-03T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-04-03T00:00:00.000Z',
+    });
+
+    edgeBackendRun.mockImplementation(
+      async (_group, _input, started, onOutput) => {
+        expect(started).toBeUndefined();
+        await onOutput?.({ status: 'success', result: 'edge result' });
+        return { status: 'success', result: 'edge result' };
+      },
+    );
+
+    const queue = {
+      closeStdin: vi.fn(),
+      enqueueTask: vi.fn(
+        async (_groupJid: string, _taskId: string, fn: () => Promise<void>) => {
+          await fn();
+        },
+      ),
+      notifyIdle: vi.fn(),
+    } as any;
+    const sendMessage = vi.fn(async () => {});
+
+    startSchedulerLoop({
+      backends: { container: backendStub, edge: edgeBackendStub },
+      defaultExecutionMode: 'auto',
+      registeredGroups: () => ({
+        'room@g.us': {
+          name: 'Team Alpha',
+          folder: 'team_alpha',
+          trigger: '@Andy',
+          added_at: '2026-04-03T00:00:00.000Z',
+          executionMode: 'auto',
+        },
+      }),
+      getSessions: () => ({}),
+      queue,
+      sendMessage,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(edgeBackendRun).toHaveBeenCalledTimes(1);
+    expect(backendRun).not.toHaveBeenCalled();
+    expect(queue.notifyIdle).not.toHaveBeenCalled();
+    expect(queue.closeStdin).not.toHaveBeenCalled();
+
+    const executions = listExecutionStates();
+    expect(executions).toHaveLength(1);
+    expect(executions[0]?.backend).toBe('edge');
+  });
+
+  it('routes auto groups with scripts to container backend', async () => {
+    createTask({
+      id: 'task-auto-script',
+      group_folder: 'team_alpha',
+      chat_jid: 'room@g.us',
+      prompt: 'scripted task',
+      script: 'echo 1',
+      schedule_type: 'once',
+      schedule_value: '2026-04-03T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-04-03T00:00:00.000Z',
+    });
+
+    const onExecutionStarted = vi.fn();
+    backendRun.mockImplementation(async (_group, input, started, onOutput) => {
+      expect(input.script).toBe('echo 1');
+      await started?.({
+        chatJid: 'room@g.us',
+        process: {} as any,
+        executionName: 'nanoclaw-task',
+        groupFolder: 'team_alpha',
+      });
+      await onOutput?.({ status: 'success', result: 'container result' });
+      return { status: 'success', result: 'container result' };
+    });
+
+    const queue = {
+      closeStdin: vi.fn(),
+      enqueueTask: vi.fn(
+        async (_groupJid: string, _taskId: string, fn: () => Promise<void>) => {
+          await fn();
+        },
+      ),
+      notifyIdle: vi.fn(),
+    } as any;
+    const sendMessage = vi.fn(async () => {});
+
+    startSchedulerLoop({
+      backends: { container: backendStub, edge: edgeBackendStub },
+      defaultExecutionMode: 'auto',
+      registeredGroups: () => ({
+        'room@g.us': {
+          name: 'Team Alpha',
+          folder: 'team_alpha',
+          trigger: '@Andy',
+          added_at: '2026-04-03T00:00:00.000Z',
+          executionMode: 'auto',
+        },
+      }),
+      getSessions: () => ({}),
+      queue,
+      onExecutionStarted,
+      sendMessage,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(backendRun).toHaveBeenCalledTimes(1);
+    expect(edgeBackendRun).not.toHaveBeenCalled();
+    expect(onExecutionStarted).toHaveBeenCalledTimes(1);
+
+    const executions = listExecutionStates();
+    expect(executions).toHaveLength(1);
+    expect(executions[0]?.backend).toBe('container');
   });
 });

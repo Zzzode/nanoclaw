@@ -6,7 +6,13 @@ import {
   AgentRunOutput,
   ExecutionStartedCallback,
 } from './agent-backend.js';
-import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
+import { selectAgentBackend } from './backend-selection.js';
+import {
+  ASSISTANT_NAME,
+  DEFAULT_EXECUTION_MODE,
+  SCHEDULER_POLL_INTERVAL,
+  TIMEZONE,
+} from './config.js';
 import { writeTasksSnapshotToIpc } from './container-snapshot-writer.js';
 import {
   getAllTasks,
@@ -25,6 +31,7 @@ import {
   heartbeatExecution,
 } from './execution-state.js';
 import { buildTaskSnapshots } from './execution-snapshots.js';
+import { type AgentBackendId, type ExecutionMode } from './execution-mode.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
@@ -72,7 +79,8 @@ export function computeNextRun(task: ScheduledTask): string | null {
 }
 
 export interface SchedulerDependencies {
-  backend: AgentBackend;
+  backends: Record<AgentBackendId, AgentBackend>;
+  defaultExecutionMode: ExecutionMode;
   registeredGroups: () => Record<string, RegisteredGroup>;
   getSessions: () => Record<string, string>;
   queue: GroupQueue;
@@ -135,9 +143,29 @@ async function runTask(
   }
 
   const isMain = group.isMain === true;
-  writeTasksSnapshotToIpc(
-    task.group_folder,
-    buildTaskSnapshots(getAllTasks(), task.group_folder, isMain),
+  const selection = selectAgentBackend(
+    group,
+    { script: task.script || undefined },
+    deps.defaultExecutionMode,
+  );
+  const usesContainer = selection.backendId === 'container';
+  const backend = deps.backends[selection.backendId];
+
+  if (usesContainer) {
+    writeTasksSnapshotToIpc(
+      task.group_folder,
+      buildTaskSnapshots(getAllTasks(), task.group_folder, isMain),
+    );
+  }
+
+  logger.debug(
+    {
+      taskId: task.id,
+      executionMode: selection.executionMode,
+      backendId: selection.backendId,
+      fallbackReason: selection.fallbackReason,
+    },
+    'Selected backend for scheduled task',
   );
 
   let result: string | null = null;
@@ -160,6 +188,7 @@ async function runTask(
   let closeTimer: ReturnType<typeof setTimeout> | null = null;
 
   const scheduleClose = () => {
+    if (!usesContainer) return;
     if (closeTimer) return; // already scheduled
     closeTimer = setTimeout(() => {
       logger.debug({ taskId: task.id }, 'Closing task container after result');
@@ -171,13 +200,13 @@ async function runTask(
     const execution = beginExecution({
       scopeType,
       scopeId,
-      backend: 'container',
+      backend: selection.backendId,
       groupJid: task.chat_jid,
       taskId: task.id,
     });
     executionId = execution.executionId;
 
-    const output = await deps.backend.run(
+    const output = await backend.run(
       group,
       {
         prompt: task.prompt,
@@ -189,7 +218,7 @@ async function runTask(
         assistantName: ASSISTANT_NAME,
         script: task.script || undefined,
       },
-      deps.onExecutionStarted,
+      usesContainer ? deps.onExecutionStarted : undefined,
       async (streamedOutput: AgentRunOutput) => {
         if (executionId) heartbeatExecution(executionId);
         if (task.context_mode === 'group' && streamedOutput.newSessionId) {
@@ -205,7 +234,7 @@ async function runTask(
           await deps.sendMessage(task.chat_jid, streamedOutput.result);
           scheduleClose();
         }
-        if (streamedOutput.status === 'success') {
+        if (usesContainer && streamedOutput.status === 'success') {
           deps.queue.notifyIdle(task.chat_jid);
           scheduleClose(); // Close promptly even when result is null (e.g. IPC-only tasks)
         }
@@ -276,6 +305,9 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
   schedulerRunning = true;
   logger.info('Scheduler loop started');
 
+  const effectiveDefaultExecutionMode =
+    deps.defaultExecutionMode || DEFAULT_EXECUTION_MODE;
+
   const loop = async () => {
     try {
       const dueTasks = getDueTasks();
@@ -291,7 +323,10 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
         }
 
         deps.queue.enqueueTask(currentTask.chat_jid, currentTask.id, () =>
-          runTask(currentTask, deps),
+          runTask(currentTask, {
+            ...deps,
+            defaultExecutionMode: effectiveDefaultExecutionMode,
+          }),
         );
       }
     } catch (err) {

@@ -661,6 +661,25 @@ describe('register_group success', () => {
     expect(group!.trigger).toBe('@Andy');
   });
 
+  it('register_group persists execution mode when provided', async () => {
+    await processTaskIpc(
+      {
+        type: 'register_group',
+        jid: 'edge@g.us',
+        name: 'Edge Group',
+        folder: 'edge-group',
+        trigger: '@Andy',
+        execution_mode: 'edge',
+      },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+
+    const group = getRegisteredGroup('edge@g.us');
+    expect(group?.executionMode).toBe('edge');
+  });
+
   it('register_group rejects request with missing fields', async () => {
     await processTaskIpc(
       {

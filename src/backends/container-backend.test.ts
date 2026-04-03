@@ -2,12 +2,19 @@ import { ChildProcess } from 'child_process';
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { runContainerAgentMock } = vi.hoisted(() => ({
-  runContainerAgentMock: vi.fn(),
-}));
+const { ensureContainerRuntimeRunningMock, runContainerAgentMock } = vi.hoisted(
+  () => ({
+    ensureContainerRuntimeRunningMock: vi.fn(),
+    runContainerAgentMock: vi.fn(),
+  }),
+);
 
 vi.mock('../container-runner.js', () => ({
   runContainerAgent: runContainerAgentMock,
+}));
+
+vi.mock('../container-runtime.js', () => ({
+  ensureContainerRuntimeRunning: ensureContainerRuntimeRunningMock,
 }));
 
 import type { AgentRunInput } from '../agent-backend.js';
@@ -30,6 +37,7 @@ const input: AgentRunInput = {
 
 describe('containerBackend', () => {
   beforeEach(() => {
+    ensureContainerRuntimeRunningMock.mockReset();
     runContainerAgentMock.mockReset();
   });
 
@@ -74,6 +82,7 @@ describe('containerBackend', () => {
     );
 
     expect(runContainerAgentMock).toHaveBeenCalledTimes(1);
+    expect(ensureContainerRuntimeRunningMock).toHaveBeenCalledTimes(1);
     expect(onExecutionStarted).toHaveBeenCalledWith({
       chatJid: 'group1@g.us',
       process: fakeProcess,
@@ -94,5 +103,6 @@ describe('containerBackend', () => {
       status: 'success',
       result: 'done',
     });
+    expect(ensureContainerRuntimeRunningMock).toHaveBeenCalledTimes(1);
   });
 });

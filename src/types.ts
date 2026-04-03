@@ -1,3 +1,5 @@
+import type { ExecutionMode } from './execution-mode.js';
+
 export interface AdditionalMount {
   hostPath: string; // Absolute path on host (supports ~ for home)
   containerPath?: string; // Optional — defaults to basename of hostPath. Mounted at /workspace/extra/{value}
@@ -37,6 +39,7 @@ export interface RegisteredGroup {
   folder: string;
   trigger: string;
   added_at: string;
+  executionMode?: ExecutionMode;
   containerConfig?: ContainerConfig;
   requiresTrigger?: boolean; // Default: true for groups, false for solo chats
   isMain?: boolean; // True for the main control group (no trigger, elevated privileges)

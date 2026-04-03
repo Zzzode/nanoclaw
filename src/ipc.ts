@@ -173,6 +173,8 @@ export async function processTaskIpc(
     name?: string;
     folder?: string;
     trigger?: string;
+    executionMode?: RegisteredGroup['executionMode'];
+    execution_mode?: RegisteredGroup['executionMode'];
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
   },
@@ -441,6 +443,8 @@ export async function processTaskIpc(
           );
           break;
         }
+        const requestedExecutionMode =
+          data.executionMode ?? data.execution_mode;
         // Defense in depth: agent cannot set isMain via IPC.
         // Preserve isMain from the existing registration so IPC config
         // updates (e.g. adding additionalMounts) don't strip the flag.
@@ -450,6 +454,7 @@ export async function processTaskIpc(
           folder: data.folder,
           trigger: data.trigger,
           added_at: new Date().toISOString(),
+          executionMode: requestedExecutionMode ?? existingGroup?.executionMode,
           containerConfig: data.containerConfig,
           requiresTrigger: data.requiresTrigger,
           isMain: existingGroup?.isMain,

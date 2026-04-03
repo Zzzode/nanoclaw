@@ -2,12 +2,14 @@ import os from 'os';
 import path from 'path';
 
 import { readEnvFile } from './env.js';
+import { resolveExecutionMode } from './execution-mode.js';
 import { isValidTimezone } from './timezone.js';
 
 // Read config values from .env (falls back to process.env).
 const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
+  'DEFAULT_EXECUTION_MODE',
   'ONECLI_URL',
   'TZ',
 ]);
@@ -43,6 +45,10 @@ export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
 
 export const CONTAINER_IMAGE =
   process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
+export const DEFAULT_EXECUTION_MODE = resolveExecutionMode(
+  process.env.DEFAULT_EXECUTION_MODE || envConfig.DEFAULT_EXECUTION_MODE,
+  'container',
+);
 export const CONTAINER_TIMEOUT = parseInt(
   process.env.CONTAINER_TIMEOUT || '1800000',
   10,

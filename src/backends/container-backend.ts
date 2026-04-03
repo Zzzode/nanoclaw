@@ -5,6 +5,7 @@ import {
   AgentRunOutput,
   ExecutionStartedCallback,
 } from '../agent-backend.js';
+import { ensureContainerRuntimeRunning } from '../container-runtime.js';
 import { runContainerAgent } from '../container-runner.js';
 import { RegisteredGroup } from '../types.js';
 
@@ -15,6 +16,8 @@ class ContainerBackend implements AgentBackend {
     onExecutionStarted?: ExecutionStartedCallback,
     onOutput?: AgentOutputCallback,
   ): Promise<AgentRunOutput> {
+    ensureContainerRuntimeRunning();
+
     return runContainerAgent(
       group,
       input,

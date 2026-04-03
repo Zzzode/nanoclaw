@@ -9,6 +9,7 @@ import path from 'path';
 
 import { STORE_DIR } from '../src/config.ts';
 import { initDatabase, setRegisteredGroup } from '../src/db.ts';
+import { isExecutionMode, type ExecutionMode } from '../src/execution-mode.ts';
 import { isValidGroupFolder } from '../src/group-folder.ts';
 import { logger } from '../src/logger.ts';
 import { emitStatus } from './status.ts';
@@ -21,6 +22,7 @@ interface RegisterArgs {
   channel: string;
   requiresTrigger: boolean;
   isMain: boolean;
+  executionMode?: string;
   assistantName: string;
 }
 
@@ -59,6 +61,9 @@ function parseArgs(args: string[]): RegisterArgs {
       case '--is-main':
         result.isMain = true;
         break;
+      case '--execution-mode':
+        result.executionMode = args[++i] || '';
+        break;
       case '--assistant-name':
         result.assistantName = args[++i] || 'Andy';
         break;
@@ -90,6 +95,17 @@ export async function run(args: string[]): Promise<void> {
     process.exit(4);
   }
 
+  if (parsed.executionMode && !isExecutionMode(parsed.executionMode)) {
+    emitStatus('REGISTER_CHANNEL', {
+      STATUS: 'failed',
+      ERROR: 'invalid_execution_mode',
+      LOG: 'logs/setup.log',
+    });
+    process.exit(4);
+  }
+
+  const executionMode = parsed.executionMode as ExecutionMode | undefined;
+
   logger.info(parsed, 'Registering channel');
 
   // Ensure data and store directories exist (store/ may not exist on
@@ -105,6 +121,7 @@ export async function run(args: string[]): Promise<void> {
     folder: parsed.folder,
     trigger: parsed.trigger,
     added_at: new Date().toISOString(),
+    executionMode,
     requiresTrigger: parsed.requiresTrigger,
     isMain: parsed.isMain,
   });
@@ -193,6 +210,7 @@ export async function run(args: string[]): Promise<void> {
     FOLDER: parsed.folder,
     CHANNEL: parsed.channel,
     TRIGGER: parsed.trigger,
+    EXECUTION_MODE: executionMode || '',
     REQUIRES_TRIGGER: parsed.requiresTrigger,
     ASSISTANT_NAME: parsed.assistantName,
     NAME_UPDATED: nameUpdated,

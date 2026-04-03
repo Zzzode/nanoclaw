@@ -16,6 +16,7 @@ import {
   getLogicalSession,
   getMessagesSince,
   getNewMessages,
+  getRegisteredGroup,
   getSession,
   getTaskById,
   listExecutionStates,
@@ -581,6 +582,20 @@ describe('registered group isMain', () => {
     const group = groups['group@g.us'];
     expect(group).toBeDefined();
     expect(group.isMain).toBeUndefined();
+  });
+
+  it('persists executionMode through set/get round-trip', () => {
+    setRegisteredGroup('edge@g.us', {
+      name: 'Edge Group',
+      folder: 'telegram_edge-group',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      executionMode: 'edge',
+    });
+
+    const group = getRegisteredGroup('edge@g.us');
+    expect(group).toBeDefined();
+    expect(group?.executionMode).toBe('edge');
   });
 });
 

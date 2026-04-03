@@ -20,6 +20,7 @@ function createTestDb(): Database.Database {
     folder TEXT NOT NULL UNIQUE,
     trigger_pattern TEXT NOT NULL,
     added_at TEXT NOT NULL,
+    execution_mode TEXT,
     container_config TEXT,
     requires_trigger INTEGER DEFAULT 1,
     is_main INTEGER DEFAULT 0
@@ -175,6 +176,28 @@ describe('parameterized SQL registration', () => {
       .get('123@g.us') as { is_main: number };
 
     expect(row.is_main).toBe(0);
+  });
+
+  it('stores execution_mode when provided', () => {
+    db.prepare(
+      `INSERT OR REPLACE INTO registered_groups
+       (jid, name, folder, trigger_pattern, added_at, execution_mode, container_config, requires_trigger)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
+    ).run(
+      'edge@g.us',
+      'Edge Group',
+      'telegram_edge-group',
+      '@Andy',
+      '2024-01-01T00:00:00.000Z',
+      'edge',
+      1,
+    );
+
+    const row = db
+      .prepare('SELECT execution_mode FROM registered_groups WHERE jid = ?')
+      .get('edge@g.us') as { execution_mode: string };
+
+    expect(row.execution_mode).toBe('edge');
   });
 
   it('upserts on conflict', () => {

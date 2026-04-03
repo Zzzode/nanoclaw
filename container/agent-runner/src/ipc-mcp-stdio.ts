@@ -460,6 +460,12 @@ Use available_groups.json to find the JID for a group. The folder name must be c
         'Channel-prefixed folder name (e.g., "whatsapp_family-chat", "telegram_dev-team")',
       ),
     trigger: z.string().describe('Trigger word (e.g., "@Andy")'),
+    execution_mode: z
+      .enum(['container', 'edge', 'auto'])
+      .optional()
+      .describe(
+        'Optional execution mode override for this group. Defaults to NanoClaw host configuration when omitted.',
+      ),
   },
   async (args) => {
     if (!isMain) {
@@ -480,6 +486,7 @@ Use available_groups.json to find the JID for a group. The folder name must be c
       name: args.name,
       folder: args.folder,
       trigger: args.trigger,
+      execution_mode: args.execution_mode,
       timestamp: new Date().toISOString(),
     };
 

@@ -4,9 +4,15 @@ import path from 'path';
 import { OneCLI } from '@onecli-sh/sdk';
 
 import { AgentBackend, AgentRunOutput } from './agent-backend.js';
+import {
+  deploymentRequiresContainerRuntime,
+  selectAgentBackend,
+} from './backend-selection.js';
+import { edgeBackend } from './backends/edge-backend.js';
 import { containerBackend } from './backends/container-backend.js';
 import {
   ASSISTANT_NAME,
+  DEFAULT_EXECUTION_MODE,
   DEFAULT_TRIGGER,
   getTriggerPattern,
   GROUPS_DIR,
@@ -74,6 +80,7 @@ import {
   shouldDropMessage,
 } from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
+import { type AgentBackendId } from './execution-mode.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
@@ -88,7 +95,10 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
-const agentBackend: AgentBackend = containerBackend;
+const agentBackends: Record<AgentBackendId, AgentBackend> = {
+  container: containerBackend,
+  edge: edgeBackend,
+};
 
 const onecli = new OneCLI({ url: ONECLI_URL });
 
@@ -356,24 +366,47 @@ async function runAgent(
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   const sessionId = sessions[group.folder];
-
-  const taskSnapshots = buildTaskSnapshots(getAllTasks(), group.folder, isMain);
-  writeTasksSnapshotToIpc(group.folder, taskSnapshots);
-
-  const availableGroups = getAvailableGroups();
-  writeGroupsSnapshotToIpc(
-    group.folder,
-    buildGroupsSnapshotPayload(availableGroups, isMain),
+  const selection = selectAgentBackend(
+    group,
+    { script: undefined },
+    DEFAULT_EXECUTION_MODE,
   );
+  const usesContainer = selection.backendId === 'container';
+  const backend = agentBackends[selection.backendId];
+
+  if (usesContainer) {
+    const taskSnapshots = buildTaskSnapshots(
+      getAllTasks(),
+      group.folder,
+      isMain,
+    );
+    writeTasksSnapshotToIpc(group.folder, taskSnapshots);
+
+    const availableGroups = getAvailableGroups();
+    writeGroupsSnapshotToIpc(
+      group.folder,
+      buildGroupsSnapshotPayload(availableGroups, isMain),
+    );
+  }
 
   let executionId: string | null = null;
   let streamedError: string | null = null;
+
+  logger.debug(
+    {
+      chatJid,
+      executionMode: selection.executionMode,
+      backendId: selection.backendId,
+      fallbackReason: selection.fallbackReason,
+    },
+    'Selected backend for group execution',
+  );
 
   try {
     const execution = beginExecution({
       scopeType: 'group',
       scopeId: group.folder,
-      backend: 'container',
+      backend: selection.backendId,
       groupJid: chatJid,
     });
     executionId = execution.executionId;
@@ -393,7 +426,7 @@ async function runAgent(
       await onOutput?.(output);
     };
 
-    const output = await agentBackend.run(
+    const output = await backend.run(
       group,
       {
         prompt,
@@ -403,13 +436,15 @@ async function runAgent(
         isMain,
         assistantName: ASSISTANT_NAME,
       },
-      (execution) =>
-        queue.registerProcess(
-          execution.chatJid,
-          execution.process,
-          execution.executionName,
-          execution.groupFolder,
-        ),
+      usesContainer
+        ? (execution) =>
+            queue.registerProcess(
+              execution.chatJid,
+              execution.process,
+              execution.executionName,
+              execution.groupFolder,
+            )
+        : undefined,
       wrappedOnOutput,
     );
 
@@ -588,10 +623,23 @@ function ensureContainerSystemRunning(): void {
 }
 
 async function main(): Promise<void> {
-  ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
   loadState();
+
+  if (
+    deploymentRequiresContainerRuntime(
+      Object.values(registeredGroups),
+      DEFAULT_EXECUTION_MODE,
+    )
+  ) {
+    ensureContainerSystemRunning();
+  } else {
+    logger.info(
+      { defaultExecutionMode: DEFAULT_EXECUTION_MODE },
+      'Skipping container runtime startup check for edge-only deployment',
+    );
+  }
 
   // Ensure OneCLI agents exist for all registered groups.
   // Recovers from missed creates (e.g. OneCLI was down at registration time).
@@ -716,7 +764,8 @@ async function main(): Promise<void> {
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
-    backend: agentBackend,
+    backends: agentBackends,
+    defaultExecutionMode: DEFAULT_EXECUTION_MODE,
     registeredGroups: () => registeredGroups,
     getSessions: () => sessions,
     queue,

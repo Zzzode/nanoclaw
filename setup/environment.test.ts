@@ -28,6 +28,7 @@ describe('registered groups DB query', () => {
       folder TEXT NOT NULL UNIQUE,
       trigger_pattern TEXT NOT NULL,
       added_at TEXT NOT NULL,
+      execution_mode TEXT,
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     )`);
@@ -118,4 +119,3 @@ describe('channel auth detection', () => {
     expect(hasAuth('/tmp/nonexistent_auth_dir_xyz')).toBe(false);
   });
 });
-

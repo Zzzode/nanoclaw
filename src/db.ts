@@ -2,7 +2,13 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 
-import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
+import {
+  ASSISTANT_NAME,
+  DATA_DIR,
+  DEFAULT_EXECUTION_MODE,
+  STORE_DIR,
+} from './config.js';
+import { resolveExecutionMode } from './execution-mode.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import {
@@ -215,6 +221,7 @@ function createSchema(database: Database.Database): void {
       folder TEXT NOT NULL UNIQUE,
       trigger_pattern TEXT NOT NULL,
       added_at TEXT NOT NULL,
+      execution_mode TEXT,
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
@@ -257,6 +264,15 @@ function createSchema(database: Database.Database): void {
     // Backfill: existing rows with folder = 'main' are the main group
     database.exec(
       `UPDATE registered_groups SET is_main = 1 WHERE folder = 'main'`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
+  // Add execution_mode column if it doesn't exist (migration for existing DBs)
+  try {
+    database.exec(
+      `ALTER TABLE registered_groups ADD COLUMN execution_mode TEXT`,
     );
   } catch {
     /* column already exists */
@@ -1257,6 +1273,7 @@ export function getRegisteredGroup(
         folder: string;
         trigger_pattern: string;
         added_at: string;
+        execution_mode: string | null;
         container_config: string | null;
         requires_trigger: number | null;
         is_main: number | null;
@@ -1276,6 +1293,9 @@ export function getRegisteredGroup(
     folder: row.folder,
     trigger: row.trigger_pattern,
     added_at: row.added_at,
+    executionMode: row.execution_mode
+      ? resolveExecutionMode(row.execution_mode, DEFAULT_EXECUTION_MODE)
+      : undefined,
     containerConfig: row.container_config
       ? JSON.parse(row.container_config)
       : undefined,
@@ -1290,14 +1310,15 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
   }
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, execution_mode, container_config, requires_trigger, is_main)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     jid,
     group.name,
     group.folder,
     group.trigger,
     group.added_at,
+    group.executionMode ?? null,
     group.containerConfig ? JSON.stringify(group.containerConfig) : null,
     group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
     group.isMain ? 1 : 0,
@@ -1311,6 +1332,7 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     folder: string;
     trigger_pattern: string;
     added_at: string;
+    execution_mode: string | null;
     container_config: string | null;
     requires_trigger: number | null;
     is_main: number | null;
@@ -1329,6 +1351,9 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
       folder: row.folder,
       trigger: row.trigger_pattern,
       added_at: row.added_at,
+      executionMode: row.execution_mode
+        ? resolveExecutionMode(row.execution_mode, DEFAULT_EXECUTION_MODE)
+        : undefined,
       containerConfig: row.container_config
         ? JSON.parse(row.container_config)
         : undefined,
