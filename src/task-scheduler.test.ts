@@ -1,11 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { AgentBackend } from './agent-backend.js';
 import { _initTestDatabase, createTask, getTaskById } from './db.js';
 import {
   _resetSchedulerLoopForTests,
   computeNextRun,
   startSchedulerLoop,
 } from './task-scheduler.js';
+
+const backendStub: AgentBackend = {
+  run: vi.fn(),
+};
 
 describe('task scheduler', () => {
   beforeEach(() => {
@@ -39,10 +44,10 @@ describe('task scheduler', () => {
     );
 
     startSchedulerLoop({
+      backend: backendStub,
       registeredGroups: () => ({}),
       getSessions: () => ({}),
       queue: { enqueueTask } as any,
-      onProcess: () => {},
       sendMessage: async () => {},
     });
 

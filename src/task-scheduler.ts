@@ -1,13 +1,13 @@
-import { ChildProcess } from 'child_process';
 import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
 
-import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
 import {
-  ContainerOutput,
-  runContainerAgent,
-  writeTasksSnapshot,
-} from './container-runner.js';
+  AgentBackend,
+  AgentRunOutput,
+  ExecutionStartedCallback,
+} from './agent-backend.js';
+import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
+import { writeTasksSnapshot } from './container-runner.js';
 import {
   getAllTasks,
   getDueTasks,
@@ -63,15 +63,11 @@ export function computeNextRun(task: ScheduledTask): string | null {
 }
 
 export interface SchedulerDependencies {
+  backend: AgentBackend;
   registeredGroups: () => Record<string, RegisteredGroup>;
   getSessions: () => Record<string, string>;
   queue: GroupQueue;
-  onProcess: (
-    groupJid: string,
-    proc: ChildProcess,
-    containerName: string,
-    groupFolder: string,
-  ) => void;
+  onExecutionStarted?: ExecutionStartedCallback;
   sendMessage: (jid: string, text: string) => Promise<void>;
 }
 
@@ -170,7 +166,7 @@ async function runTask(
   };
 
   try {
-    const output = await runContainerAgent(
+    const output = await deps.backend.run(
       group,
       {
         prompt: task.prompt,
@@ -182,9 +178,8 @@ async function runTask(
         assistantName: ASSISTANT_NAME,
         script: task.script || undefined,
       },
-      (proc, containerName) =>
-        deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
-      async (streamedOutput: ContainerOutput) => {
+      deps.onExecutionStarted,
+      async (streamedOutput: AgentRunOutput) => {
         if (streamedOutput.result) {
           result = streamedOutput.result;
           // Forward result to user (sendMessage handles formatting)

@@ -3,6 +3,8 @@ import path from 'path';
 
 import { OneCLI } from '@onecli-sh/sdk';
 
+import { AgentBackend, AgentRunOutput } from './agent-backend.js';
+import { containerBackend } from './backends/container-backend.js';
 import {
   ASSISTANT_NAME,
   DEFAULT_TRIGGER,
@@ -20,8 +22,6 @@ import {
   getRegisteredChannelNames,
 } from './channels/registry.js';
 import {
-  ContainerOutput,
-  runContainerAgent,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -76,6 +76,7 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+const agentBackend: AgentBackend = containerBackend;
 
 const onecli = new OneCLI({ url: ONECLI_URL });
 
@@ -339,7 +340,7 @@ async function runAgent(
   group: RegisteredGroup,
   prompt: string,
   chatJid: string,
-  onOutput?: (output: ContainerOutput) => Promise<void>,
+  onOutput?: (output: AgentRunOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   const sessionId = sessions[group.folder];
@@ -372,7 +373,7 @@ async function runAgent(
 
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = onOutput
-    ? async (output: ContainerOutput) => {
+    ? async (output: AgentRunOutput) => {
         if (output.newSessionId) {
           sessions[group.folder] = output.newSessionId;
           setSession(group.folder, output.newSessionId);
@@ -382,7 +383,7 @@ async function runAgent(
     : undefined;
 
   try {
-    const output = await runContainerAgent(
+    const output = await agentBackend.run(
       group,
       {
         prompt,
@@ -392,8 +393,13 @@ async function runAgent(
         isMain,
         assistantName: ASSISTANT_NAME,
       },
-      (proc, containerName) =>
-        queue.registerProcess(chatJid, proc, containerName, group.folder),
+      (execution) =>
+        queue.registerProcess(
+          execution.chatJid,
+          execution.process,
+          execution.executionName,
+          execution.groupFolder,
+        ),
       wrappedOnOutput,
     );
 
@@ -696,11 +702,17 @@ async function main(): Promise<void> {
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
+    backend: agentBackend,
     registeredGroups: () => registeredGroups,
     getSessions: () => sessions,
     queue,
-    onProcess: (groupJid, proc, containerName, groupFolder) =>
-      queue.registerProcess(groupJid, proc, containerName, groupFolder),
+    onExecutionStarted: (execution) =>
+      queue.registerProcess(
+        execution.chatJid,
+        execution.process,
+        execution.executionName,
+        execution.groupFolder,
+      ),
     sendMessage: async (jid, rawText) => {
       const channel = findChannel(channels, jid);
       if (!channel) {
