@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   _initTestDatabase,
   buildLogicalSessionId,
+  createExecutionCheckpoint,
   createExecutionState,
   createLogicalSession,
   createTask,
@@ -16,9 +17,11 @@ import {
   getLogicalSession,
   getMessagesSince,
   getNewMessages,
+  getRecentConversationMessages,
   getRegisteredGroup,
   getSession,
   getTaskById,
+  listExecutionCheckpoints,
   listExecutionStates,
   listLogicalSessions,
   setRegisteredGroup,
@@ -549,6 +552,40 @@ describe('message query LIMIT', () => {
     );
     expect(messages).toHaveLength(10);
   });
+
+  it('returns recent conversation history including bot messages', () => {
+    storeMessage({
+      id: 'bot-1',
+      chat_jid: 'group@g.us',
+      sender: 'Andy',
+      sender_name: 'Andy',
+      content: 'assistant reply',
+      timestamp: '2024-01-01T00:00:11.000Z',
+      is_from_me: true,
+      is_bot_message: true,
+    });
+
+    const history = getRecentConversationMessages('group@g.us', 3);
+
+    expect(history).toEqual([
+      expect.objectContaining({
+        id: 'lim-9',
+        content: 'message 9',
+        isBotMessage: false,
+      }),
+      expect.objectContaining({
+        id: 'lim-10',
+        content: 'message 10',
+        isBotMessage: false,
+      }),
+      expect.objectContaining({
+        id: 'bot-1',
+        content: 'assistant reply',
+        isBotMessage: true,
+        isFromMe: true,
+      }),
+    ]);
+  });
 });
 
 // --- RegisteredGroup isMain round-trip ---
@@ -656,6 +693,7 @@ describe('execution state accessors', () => {
       executionId: 'exec-1',
       logicalSessionId,
       turnId: 'turn-1',
+      taskNodeId: null,
       groupJid: 'main@g.us',
       taskId: null,
       backend: 'container',
@@ -686,6 +724,73 @@ describe('execution state accessors', () => {
       status: 'failed',
     });
     expect(listExecutionStates('failed')).toHaveLength(1);
+  });
+
+  it('stores idempotent execution checkpoints', () => {
+    const logicalSessionId = buildLogicalSessionId('group', 'main');
+    createLogicalSession({
+      id: logicalSessionId,
+      scopeType: 'group',
+      scopeId: 'main',
+      providerSessionId: null,
+      status: 'active',
+      lastTurnId: null,
+      workspaceVersion: null,
+      groupMemoryVersion: null,
+      summaryRef: null,
+      recentMessagesWindow: null,
+      createdAt: '2026-04-03T00:00:00.000Z',
+      updatedAt: '2026-04-03T00:00:00.000Z',
+    });
+
+    createExecutionState({
+      executionId: 'exec-2',
+      logicalSessionId,
+      turnId: 'turn-2',
+      taskNodeId: null,
+      groupJid: 'main@g.us',
+      taskId: null,
+      backend: 'edge',
+      edgeNodeId: null,
+      baseWorkspaceVersion: 'workspace:1',
+      leaseUntil: '2026-04-03T00:30:00.000Z',
+      status: 'running',
+      lastHeartbeatAt: null,
+      cancelRequestedAt: null,
+      committedAt: null,
+      finishedAt: null,
+      error: null,
+      createdAt: '2026-04-03T00:00:00.000Z',
+      updatedAt: '2026-04-03T00:00:00.000Z',
+    });
+
+    createExecutionCheckpoint({
+      executionId: 'exec-2',
+      checkpointKey: 'checkpoint-1',
+      providerSessionId: 'provider-session-2',
+      summaryDelta: 'summary',
+      workspaceOverlayDigest: 'workspace:unchanged',
+      createdAt: '2026-04-03T00:00:01.000Z',
+    });
+    createExecutionCheckpoint({
+      executionId: 'exec-2',
+      checkpointKey: 'checkpoint-1',
+      providerSessionId: 'provider-session-2',
+      summaryDelta: 'summary',
+      workspaceOverlayDigest: 'workspace:unchanged',
+      createdAt: '2026-04-03T00:00:02.000Z',
+    });
+
+    expect(listExecutionCheckpoints('exec-2')).toEqual([
+      {
+        executionId: 'exec-2',
+        checkpointKey: 'checkpoint-1',
+        providerSessionId: 'provider-session-2',
+        summaryDelta: 'summary',
+        workspaceOverlayDigest: 'workspace:unchanged',
+        createdAt: '2026-04-03T00:00:01.000Z',
+      },
+    ]);
   });
 });
 
