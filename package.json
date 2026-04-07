@@ -6,6 +6,10 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
+    "canary:terminal:edge": "npm run build && TERMINAL_CHANNEL=true DEFAULT_EXECUTION_MODE=edge EDGE_RUNNER_MODE=edgejs EDGE_RUNNER_PROVIDER=anthropic node dist/index.js",
+    "canary:terminal:openai": "npm run build && TERMINAL_CHANNEL=true DEFAULT_EXECUTION_MODE=edge EDGE_RUNNER_MODE=edgejs EDGE_RUNNER_PROVIDER=openai EDGE_ENABLE_TOOLS=true node dist/index.js",
+    "dogfood:terminal": "npm run build && TERMINAL_CHANNEL=true DEFAULT_EXECUTION_MODE=edge TERMINAL_GROUP_EXECUTION_MODE=edge EDGE_RUNNER_MODE=edgejs EDGE_RUNNER_PROVIDER=openai EDGE_ENABLE_TOOLS=true MAX_CONCURRENT_CONTAINERS=5 node dist/index.js",
+    "canary:terminal:stub": "npm run build && TERMINAL_CHANNEL=true DEFAULT_EXECUTION_MODE=edge EDGE_RUNNER_MODE=edgejs EDGE_RUNNER_PROVIDER=local node dist/index.js",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
