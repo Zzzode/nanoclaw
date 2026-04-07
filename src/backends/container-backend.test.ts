@@ -18,7 +18,7 @@ vi.mock('../container-runtime.js', () => ({
 }));
 
 import type { AgentRunInput } from '../agent-backend.js';
-import { containerBackend } from './container-backend.js';
+import { containerBackend, heavyWorker } from './container-backend.js';
 import type { RegisteredGroup } from '../types.js';
 
 const group: RegisteredGroup = {
@@ -104,5 +104,22 @@ describe('containerBackend', () => {
       result: 'done',
     });
     expect(ensureContainerRuntimeRunningMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('exposes the heavy worker contract metadata', () => {
+    expect(containerBackend).toBe(heavyWorker);
+    expect(heavyWorker).toMatchObject({
+      backendId: 'container',
+      workerClass: 'heavy',
+      runtimeClass: 'container',
+      plannedSpecializations: ['local-shell', 'browser-worker', 'app-worker'],
+      capabilityEnvelope: [
+        'shell.exec',
+        'browser.exec',
+        'app.exec',
+        'local.secret',
+        'interactive.longlived',
+      ],
+    });
   });
 });
