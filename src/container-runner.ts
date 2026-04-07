@@ -7,6 +7,9 @@ import fs from 'fs';
 import path from 'path';
 
 import {
+  CONTAINER_ANTHROPIC_API_KEY,
+  CONTAINER_ANTHROPIC_BASE_URL,
+  CONTAINER_ANTHROPIC_MODEL,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
@@ -246,6 +249,15 @@ async function buildContainerArgs(
       { containerName },
       'OneCLI gateway not reachable — container will have no credentials',
     );
+    if (CONTAINER_ANTHROPIC_BASE_URL) {
+      args.push('-e', `ANTHROPIC_BASE_URL=${CONTAINER_ANTHROPIC_BASE_URL}`);
+    }
+    if (CONTAINER_ANTHROPIC_API_KEY) {
+      args.push('-e', `ANTHROPIC_API_KEY=${CONTAINER_ANTHROPIC_API_KEY}`);
+    }
+    if (CONTAINER_ANTHROPIC_MODEL) {
+      args.push('-e', `ANTHROPIC_MODEL=${CONTAINER_ANTHROPIC_MODEL}`);
+    }
   }
 
   // Runtime-specific args for host gateway resolution

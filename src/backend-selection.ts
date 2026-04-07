@@ -4,47 +4,38 @@ import {
   type AgentBackendId,
   type ExecutionMode,
 } from './execution-mode.js';
+import {
+  resolveGroupExecutionMode,
+  routeTaskNode,
+  type BackendFallbackReason,
+  type CapabilityTag,
+  type RouteReason,
+} from './policy-router.js';
 import type { RegisteredGroup } from './types.js';
 
-export type BackendFallbackReason = 'script_requires_container';
+export type {
+  BackendFallbackReason,
+  CapabilityTag,
+  RouteReason,
+} from './policy-router.js';
+export { resolveGroupExecutionMode } from './policy-router.js';
 
 export interface BackendSelection {
   executionMode: ExecutionMode;
   backendId: AgentBackendId;
+  requiredCapabilities: CapabilityTag[];
+  routeReason: RouteReason;
+  policyVersion: string;
+  fallbackEligible: boolean;
   fallbackReason?: BackendFallbackReason;
-}
-
-export function resolveGroupExecutionMode(
-  group: Pick<RegisteredGroup, 'executionMode'> | undefined,
-  defaultExecutionMode: ExecutionMode,
-): ExecutionMode {
-  return group?.executionMode ?? defaultExecutionMode;
 }
 
 export function selectAgentBackend(
   group: Pick<RegisteredGroup, 'executionMode'> | undefined,
-  input: Pick<AgentRunInput, 'script'>,
+  input: Pick<AgentRunInput, 'script' | 'prompt'>,
   defaultExecutionMode: ExecutionMode,
 ): BackendSelection {
-  const executionMode = resolveGroupExecutionMode(group, defaultExecutionMode);
-
-  if (executionMode === 'container') {
-    return { executionMode, backendId: 'container' };
-  }
-
-  if (executionMode === 'edge') {
-    return { executionMode, backendId: 'edge' };
-  }
-
-  if (input.script) {
-    return {
-      executionMode,
-      backendId: 'container',
-      fallbackReason: 'script_requires_container',
-    };
-  }
-
-  return { executionMode, backendId: 'edge' };
+  return routeTaskNode(group, input, defaultExecutionMode);
 }
 
 export function groupMayUseContainerRuntime(

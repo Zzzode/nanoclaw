@@ -4,6 +4,7 @@ import path from 'path';
 
 import { DATA_DIR, MAX_CONCURRENT_CONTAINERS } from './config.js';
 import { logger } from './logger.js';
+import { emitTerminalSystemEvent } from './channels/terminal.js';
 
 interface QueuedTask {
   id: string;
@@ -11,26 +12,34 @@ interface QueuedTask {
   fn: () => Promise<void>;
 }
 
+export type QueueLane = 'foreground' | 'background';
+
 const MAX_RETRIES = 5;
 const BASE_RETRY_MS = 5000;
 
-interface GroupState {
+interface LaneState {
   active: boolean;
   idleWaiting: boolean;
   isTaskContainer: boolean;
   runningTaskId: string | null;
-  pendingMessages: boolean;
-  pendingTasks: QueuedTask[];
+  retryScheduled: boolean;
   process: ChildProcess | null;
   containerName: string | null;
   groupFolder: string | null;
   retryCount: number;
 }
 
+interface GroupState {
+  pendingMessages: boolean;
+  pendingTasks: QueuedTask[];
+  foreground: LaneState;
+  background: LaneState;
+}
+
 export class GroupQueue {
   private groups = new Map<string, GroupState>();
   private activeCount = 0;
-  private waitingGroups: string[] = [];
+  private waitingGroups: Array<{ groupJid: string; lane: QueueLane }> = [];
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
     null;
   private shuttingDown = false;
@@ -39,32 +48,68 @@ export class GroupQueue {
     let state = this.groups.get(groupJid);
     if (!state) {
       state = {
-        active: false,
-        idleWaiting: false,
-        isTaskContainer: false,
-        runningTaskId: null,
         pendingMessages: false,
         pendingTasks: [],
-        process: null,
-        containerName: null,
-        groupFolder: null,
-        retryCount: 0,
+        foreground: {
+          active: false,
+          idleWaiting: false,
+          isTaskContainer: false,
+          runningTaskId: null,
+          retryScheduled: false,
+          process: null,
+          containerName: null,
+          groupFolder: null,
+          retryCount: 0,
+        },
+        background: {
+          active: false,
+          idleWaiting: false,
+          isTaskContainer: true,
+          runningTaskId: null,
+          retryScheduled: false,
+          process: null,
+          containerName: null,
+          groupFolder: null,
+          retryCount: 0,
+        },
       };
       this.groups.set(groupJid, state);
     }
     return state;
   }
 
+  private getLaneState(groupJid: string, lane: QueueLane): LaneState {
+    return this.getGroup(groupJid)[lane];
+  }
+
+  private enqueueWaitingGroup(groupJid: string, lane: QueueLane): void {
+    if (
+      this.waitingGroups.some(
+        (entry) => entry.groupJid === groupJid && entry.lane === lane,
+      )
+    ) {
+      return;
+    }
+    this.waitingGroups.push({ groupJid, lane });
+  }
+
   setProcessMessagesFn(fn: (groupJid: string) => Promise<boolean>): void {
     this.processMessagesFn = fn;
+  }
+
+  hasForegroundWork(groupJid: string): boolean {
+    const { foreground, pendingMessages } = this.getGroup(groupJid);
+    return foreground.active || pendingMessages || foreground.retryScheduled;
   }
 
   enqueueMessageCheck(groupJid: string): void {
     if (this.shuttingDown) return;
 
     const state = this.getGroup(groupJid);
+    const foreground = state.foreground;
+    foreground.retryScheduled = false;
 
-    if (state.active) {
+    if (foreground.active) {
       state.pendingMessages = true;
       logger.debug({ groupJid }, 'Container active, message queued');
       return;
@@ -72,9 +117,7 @@ export class GroupQueue {
 
     if (this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
       state.pendingMessages = true;
-      if (!this.waitingGroups.includes(groupJid)) {
-        this.waitingGroups.push(groupJid);
-      }
+      this.enqueueWaitingGroup(groupJid, 'foreground');
       logger.debug(
         { groupJid, activeCount: this.activeCount },
         'At concurrency limit, message queued',
@@ -91,9 +134,10 @@ export class GroupQueue {
     if (this.shuttingDown) return;
 
     const state = this.getGroup(groupJid);
+    const background = state.background;
 
     // Prevent double-queuing: check both pending and currently-running task
-    if (state.runningTaskId === taskId) {
+    if (background.runningTaskId === taskId) {
       logger.debug({ groupJid, taskId }, 'Task already running, skipping');
       return;
     }
@@ -102,10 +146,10 @@ export class GroupQueue {
       return;
     }
 
-    if (state.active) {
+    if (background.active) {
       state.pendingTasks.push({ id: taskId, groupJid, fn });
-      if (state.idleWaiting) {
-        this.closeStdin(groupJid);
+      if (background.idleWaiting) {
+        this.closeStdin(groupJid, 'background');
       }
       logger.debug({ groupJid, taskId }, 'Container active, task queued');
       return;
@@ -113,9 +157,7 @@ export class GroupQueue {
 
     if (this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
       state.pendingTasks.push({ id: taskId, groupJid, fn });
-      if (!this.waitingGroups.includes(groupJid)) {
-        this.waitingGroups.push(groupJid);
-      }
+      this.enqueueWaitingGroup(groupJid, 'background');
       logger.debug(
         { groupJid, taskId, activeCount: this.activeCount },
         'At concurrency limit, task queued',
@@ -129,13 +171,41 @@ export class GroupQueue {
     );
   }
 
+  cancelTask(groupJid: string, taskId: string): void {
+    const state = this.getGroup(groupJid);
+    const pendingBefore = state.pendingTasks.length;
+    state.pendingTasks = state.pendingTasks.filter(
+      (task) => task.id !== taskId,
+    );
+
+    if (state.background.runningTaskId === taskId) {
+      this.closeStdin(groupJid, 'background');
+    }
+
+    if (
+      pendingBefore !== state.pendingTasks.length ||
+      state.background.runningTaskId === taskId
+    ) {
+      logger.info(
+        {
+          groupJid,
+          taskId,
+          pendingRemoved: pendingBefore - state.pendingTasks.length,
+          runningCancelled: state.background.runningTaskId === taskId,
+        },
+        'Cancelled scheduled task in queue',
+      );
+    }
+  }
+
   registerProcess(
     groupJid: string,
     proc: ChildProcess,
     containerName: string,
     groupFolder?: string,
+    lane: QueueLane = 'foreground',
   ): void {
-    const state = this.getGroup(groupJid);
+    const state = this.getLaneState(groupJid, lane);
     state.process = proc;
     state.containerName = containerName;
     if (groupFolder) state.groupFolder = groupFolder;
@@ -145,11 +215,12 @@ export class GroupQueue {
    * Mark the container as idle-waiting (finished work, waiting for IPC input).
    * If tasks are pending, preempt the idle container immediately.
    */
-  notifyIdle(groupJid: string): void {
-    const state = this.getGroup(groupJid);
+  notifyIdle(groupJid: string, lane: QueueLane = 'foreground'): void {
+    const groupState = this.getGroup(groupJid);
+    const state = groupState[lane];
     state.idleWaiting = true;
-    if (state.pendingTasks.length > 0) {
-      this.closeStdin(groupJid);
+    if (lane === 'background' && groupState.pendingTasks.length > 0) {
+      this.closeStdin(groupJid, 'background');
     }
   }
 
@@ -158,7 +229,7 @@ export class GroupQueue {
    * Returns true if the message was written, false if no active container.
    */
   sendMessage(groupJid: string, text: string): boolean {
-    const state = this.getGroup(groupJid);
+    const state = this.getLaneState(groupJid, 'foreground');
     if (!state.active || !state.groupFolder || state.isTaskContainer)
       return false;
     state.idleWaiting = false; // Agent is about to receive work, no longer idle
@@ -180,8 +251,8 @@ export class GroupQueue {
   /**
    * Signal the active container to wind down by writing a close sentinel.
    */
-  closeStdin(groupJid: string): void {
-    const state = this.getGroup(groupJid);
+  closeStdin(groupJid: string, lane: QueueLane = 'foreground'): void {
+    const state = this.getLaneState(groupJid, lane);
     if (!state.active || !state.groupFolder) return;
 
     const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
@@ -197,11 +268,12 @@ export class GroupQueue {
     groupJid: string,
     reason: 'messages' | 'drain',
   ): Promise<void> {
-    const state = this.getGroup(groupJid);
+    const state = this.getLaneState(groupJid, 'foreground');
     state.active = true;
     state.idleWaiting = false;
     state.isTaskContainer = false;
-    state.pendingMessages = false;
+    this.getGroup(groupJid).pendingMessages = false;
+    state.retryScheduled = false;
     this.activeCount++;
 
     logger.debug(
@@ -215,12 +287,12 @@ export class GroupQueue {
         if (success) {
           state.retryCount = 0;
         } else {
-          this.scheduleRetry(groupJid, state);
+          this.scheduleRetry(groupJid, this.getGroup(groupJid));
         }
       }
     } catch (err) {
       logger.error({ groupJid, err }, 'Error processing messages for group');
-      this.scheduleRetry(groupJid, state);
+      this.scheduleRetry(groupJid, this.getGroup(groupJid));
     } finally {
       state.active = false;
       state.process = null;
@@ -232,7 +304,7 @@ export class GroupQueue {
   }
 
   private async runTask(groupJid: string, task: QueuedTask): Promise<void> {
-    const state = this.getGroup(groupJid);
+    const state = this.getLaneState(groupJid, 'background');
     state.active = true;
     state.idleWaiting = false;
     state.isTaskContainer = true;
@@ -261,20 +333,27 @@ export class GroupQueue {
   }
 
   private scheduleRetry(groupJid: string, state: GroupState): void {
-    state.retryCount++;
-    if (state.retryCount > MAX_RETRIES) {
+    const foreground = state.foreground;
+    foreground.retryCount++;
+    if (foreground.retryCount > MAX_RETRIES) {
+      foreground.retryScheduled = false;
       logger.error(
-        { groupJid, retryCount: state.retryCount },
+        { groupJid, retryCount: foreground.retryCount },
         'Max retries exceeded, dropping messages (will retry on next incoming message)',
       );
-      state.retryCount = 0;
+      foreground.retryCount = 0;
       return;
     }
 
-    const delayMs = BASE_RETRY_MS * Math.pow(2, state.retryCount - 1);
+    foreground.retryScheduled = true;
+    const delayMs = BASE_RETRY_MS * Math.pow(2, foreground.retryCount - 1);
     logger.info(
-      { groupJid, retryCount: state.retryCount, delayMs },
+      { groupJid, retryCount: foreground.retryCount, delayMs },
       'Scheduling retry with backoff',
+    );
+    emitTerminalSystemEvent(
+      groupJid,
+      `执行失败，${Math.round(delayMs / 1000)} 秒后重试（第 ${foreground.retryCount} 次）`,
     );
     setTimeout(() => {
       if (!this.shuttingDown) {
@@ -288,8 +367,24 @@ export class GroupQueue {
 
     const state = this.getGroup(groupJid);
 
-    // Tasks first (they won't be re-discovered from SQLite like messages)
-    if (state.pendingTasks.length > 0) {
+    if (
+      !state.foreground.active &&
+      state.pendingMessages &&
+      this.activeCount < MAX_CONCURRENT_CONTAINERS
+    ) {
+      this.runForGroup(groupJid, 'drain').catch((err) =>
+        logger.error(
+          { groupJid, err },
+          'Unhandled error in runForGroup (drain)',
+        ),
+      );
+    }
+
+    if (
+      !state.background.active &&
+      state.pendingTasks.length > 0 &&
+      this.activeCount < MAX_CONCURRENT_CONTAINERS
+    ) {
       const task = state.pendingTasks.shift()!;
       this.runTask(groupJid, task).catch((err) =>
         logger.error(
@@ -297,21 +392,8 @@ export class GroupQueue {
           'Unhandled error in runTask (drain)',
         ),
       );
-      return;
     }
 
-    // Then pending messages
-    if (state.pendingMessages) {
-      this.runForGroup(groupJid, 'drain').catch((err) =>
-        logger.error(
-          { groupJid, err },
-          'Unhandled error in runForGroup (drain)',
-        ),
-      );
-      return;
-    }
-
-    // Nothing pending for this group; check if other groups are waiting for a slot
     this.drainWaiting();
   }
 
@@ -320,23 +402,55 @@ export class GroupQueue {
       this.waitingGroups.length > 0 &&
       this.activeCount < MAX_CONCURRENT_CONTAINERS
     ) {
-      const nextJid = this.waitingGroups.shift()!;
-      const state = this.getGroup(nextJid);
+      const foregroundIndex = this.waitingGroups.findIndex((entry) => {
+        const state = this.getGroup(entry.groupJid);
+        return (
+          entry.lane === 'foreground' &&
+          !state.foreground.active &&
+          state.pendingMessages
+        );
+      });
+      const backgroundIndex =
+        foregroundIndex === -1
+          ? this.waitingGroups.findIndex((entry) => {
+              const state = this.getGroup(entry.groupJid);
+              return (
+                entry.lane === 'background' &&
+                !state.background.active &&
+                state.pendingTasks.length > 0
+              );
+            })
+          : -1;
+      const nextIndex =
+        foregroundIndex !== -1
+          ? foregroundIndex
+          : backgroundIndex !== -1
+            ? backgroundIndex
+            : 0;
+      const [nextEntry] = this.waitingGroups.splice(nextIndex, 1);
+      const state = this.getGroup(nextEntry.groupJid);
 
-      // Prioritize tasks over messages
-      if (state.pendingTasks.length > 0) {
-        const task = state.pendingTasks.shift()!;
-        this.runTask(nextJid, task).catch((err) =>
+      if (
+        nextEntry.lane === 'foreground' &&
+        state.pendingMessages &&
+        !state.foreground.active
+      ) {
+        this.runForGroup(nextEntry.groupJid, 'drain').catch((err) =>
           logger.error(
-            { groupJid: nextJid, taskId: task.id, err },
-            'Unhandled error in runTask (waiting)',
+            { groupJid: nextEntry.groupJid, err },
+            'Unhandled error in runForGroup (waiting)',
           ),
         );
-      } else if (state.pendingMessages) {
-        this.runForGroup(nextJid, 'drain').catch((err) =>
+      } else if (
+        nextEntry.lane === 'background' &&
+        state.pendingTasks.length > 0 &&
+        !state.background.active
+      ) {
+        const task = state.pendingTasks.shift()!;
+        this.runTask(nextEntry.groupJid, task).catch((err) =>
           logger.error(
-            { groupJid: nextJid, err },
-            'Unhandled error in runForGroup (waiting)',
+            { groupJid: nextEntry.groupJid, taskId: task.id, err },
+            'Unhandled error in runTask (waiting)',
           ),
         );
       }
@@ -352,8 +466,14 @@ export class GroupQueue {
     // This prevents WhatsApp reconnection restarts from killing working agents.
     const activeContainers: string[] = [];
     for (const [_jid, state] of this.groups) {
-      if (state.process && !state.process.killed && state.containerName) {
-        activeContainers.push(state.containerName);
+      for (const laneState of [state.foreground, state.background]) {
+        if (
+          laneState.process &&
+          !laneState.process.killed &&
+          laneState.containerName
+        ) {
+          activeContainers.push(laneState.containerName);
+        }
       }
     }
 

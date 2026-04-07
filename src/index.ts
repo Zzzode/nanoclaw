@@ -3,13 +3,10 @@ import path from 'path';
 
 import { OneCLI } from '@onecli-sh/sdk';
 
-import { AgentBackend, AgentRunOutput } from './agent-backend.js';
-import {
-  deploymentRequiresContainerRuntime,
-  selectAgentBackend,
-} from './backend-selection.js';
+import { AgentRunOutput } from './agent-backend.js';
+import { deploymentRequiresContainerRuntime } from './backend-selection.js';
 import { edgeBackend } from './backends/edge-backend.js';
-import { containerBackend } from './backends/container-backend.js';
+import { heavyWorker } from './backends/container-backend.js';
 import {
   ASSISTANT_NAME,
   DEFAULT_EXECUTION_MODE,
@@ -20,6 +17,13 @@ import {
   MAX_MESSAGES_PER_PROMPT,
   ONECLI_URL,
   POLL_INTERVAL,
+  SHADOW_EXECUTION_MODE,
+  TERMINAL_CHANNEL_ENABLED,
+  TERMINAL_GROUP_EXECUTION_MODE,
+  TERMINAL_GROUP_FOLDER,
+  TERMINAL_GROUP_JID,
+  TERMINAL_GROUP_NAME,
+  TERMINAL_RESET_SESSION_ON_START,
   TIMEZONE,
 } from './config.js';
 import './channels/index.js';
@@ -29,6 +33,7 @@ import {
 } from './channels/registry.js';
 import {
   writeGroupsSnapshotToIpc,
+  syncObservabilitySnapshotToIpc,
   writeTasksSnapshotToIpc,
 } from './container-snapshot-writer.js';
 import {
@@ -51,9 +56,9 @@ import {
   setSession,
   storeChatMetadata,
   storeMessage,
+  storeMessageDirect,
 } from './db.js';
 import {
-  beginExecution,
   commitExecution,
   completeExecution,
   failExecution,
@@ -64,6 +69,11 @@ import {
   buildTaskSnapshots,
   type GroupSnapshot,
 } from './execution-snapshots.js';
+import {
+  classifyRuntimeRecovery,
+  markTaskNodeForReplan,
+  prepareHeavyFallbackExecution,
+} from './framework-recovery.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
@@ -79,8 +89,22 @@ import {
   loadSenderAllowlist,
   shouldDropMessage,
 } from './sender-allowlist.js';
+import {
+  runShadowExecutionComparison,
+  selectShadowExecution,
+} from './shadow-execution.js';
+import { emitTerminalSystemEvent } from './channels/terminal.js';
+import { createFrameworkRunContext } from './framework-orchestrator.js';
+import {
+  createFrameworkWorkerRegistry,
+  type FrameworkWorkerRegistry,
+} from './framework-worker.js';
+import { maybeRunEdgeTeamOrchestration } from './team-orchestrator.js';
+import {
+  completeRootTaskGraph,
+  failRootTaskGraph,
+} from './task-graph-state.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { type AgentBackendId } from './execution-mode.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
@@ -95,10 +119,12 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
-const agentBackends: Record<AgentBackendId, AgentBackend> = {
-  container: containerBackend,
-  edge: edgeBackend,
-};
+const frameworkWorkers: FrameworkWorkerRegistry = createFrameworkWorkerRegistry(
+  {
+    container: heavyWorker,
+    edge: edgeBackend,
+  },
+);
 
 const onecli = new OneCLI({ url: ONECLI_URL });
 
@@ -211,6 +237,53 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   );
 }
 
+function ensureTerminalCanaryGroup(): void {
+  if (!TERMINAL_CHANNEL_ENABLED) return;
+  const existing = registeredGroups[TERMINAL_GROUP_JID];
+  if (
+    existing &&
+    existing.folder === TERMINAL_GROUP_FOLDER &&
+    existing.executionMode === TERMINAL_GROUP_EXECUTION_MODE &&
+    existing.requiresTrigger === false
+  ) {
+    return;
+  }
+
+  registerGroup(TERMINAL_GROUP_JID, {
+    name: TERMINAL_GROUP_NAME,
+    folder: TERMINAL_GROUP_FOLDER,
+    trigger: DEFAULT_TRIGGER,
+    added_at: new Date().toISOString(),
+    executionMode: TERMINAL_GROUP_EXECUTION_MODE,
+    requiresTrigger: false,
+  });
+}
+
+function resetTerminalSession(reason: 'startup' | 'command'): void {
+  delete sessions[TERMINAL_GROUP_FOLDER];
+  deleteSession(TERMINAL_GROUP_FOLDER);
+  logger.info(
+    { group: TERMINAL_GROUP_FOLDER, reason },
+    'Terminal session reset',
+  );
+}
+
+function recordBotMessage(chatJid: string, text: string): void {
+  const normalized = text.trim();
+  if (!normalized) return;
+  const timestamp = new Date().toISOString();
+  storeMessageDirect({
+    id: `bot:${chatJid}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+    chat_jid: chatJid,
+    sender: ASSISTANT_NAME,
+    sender_name: ASSISTANT_NAME,
+    content: normalized,
+    timestamp,
+    is_from_me: true,
+    is_bot_message: true,
+  });
+}
+
 /**
  * Get available groups list for the agent.
  * Returns groups ordered by most recent activity.
@@ -234,6 +307,30 @@ export function _setRegisteredGroups(
   groups: Record<string, RegisteredGroup>,
 ): void {
   registeredGroups = groups;
+}
+
+/** @internal - exported for testing */
+export function _setChannelsForTests(next: Channel[]): void {
+  channels.splice(0, channels.length, ...next);
+}
+
+/** @internal - exported for testing */
+export function _setSessionsForTests(next: Record<string, string>): void {
+  sessions = next;
+}
+
+/** @internal - exported for testing */
+export function _setLastAgentTimestampForTests(
+  next: Record<string, string>,
+): void {
+  lastAgentTimestamp = next;
+}
+
+/** @internal - exported for testing */
+export async function _processGroupMessagesForTests(
+  chatJid: string,
+): Promise<boolean> {
+  return processGroupMessages(chatJid);
 }
 
 /**
@@ -317,6 +414,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
       if (text) {
         await channel.sendMessage(chatJid, text);
+        recordBotMessage(chatJid, text);
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -366,15 +464,32 @@ async function runAgent(
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   const sessionId = sessions[group.folder];
-  const selection = selectAgentBackend(
+  const frameworkRun = createFrameworkRunContext({
+    requestKind: 'group_turn',
     group,
-    { script: undefined },
-    DEFAULT_EXECUTION_MODE,
-  );
-  const usesContainer = selection.backendId === 'container';
-  const backend = agentBackends[selection.backendId];
+    input: {
+      prompt,
+      script: undefined,
+      chatJid,
+    },
+    defaultExecutionMode: DEFAULT_EXECUTION_MODE,
+    executionScope: {
+      scopeType: 'group',
+      scopeId: group.folder,
+      groupJid: chatJid,
+    },
+  });
+  const {
+    placement,
+    graph,
+    execution,
+    executionContext,
+    baseWorkspaceVersion,
+  } = frameworkRun;
+  const usesHeavyWorker = placement.workerClass === 'heavy';
+  const backend = frameworkWorkers[placement.backendId];
 
-  if (usesContainer) {
+  if (usesHeavyWorker) {
     const taskSnapshots = buildTaskSnapshots(
       getAllTasks(),
       group.folder,
@@ -387,29 +502,37 @@ async function runAgent(
       group.folder,
       buildGroupsSnapshotPayload(availableGroups, isMain),
     );
+    syncObservabilitySnapshotToIpc(group.folder);
   }
 
   let executionId: string | null = null;
   let streamedError: string | null = null;
+  let streamedVisibleResult = false;
 
   logger.debug(
     {
       chatJid,
-      executionMode: selection.executionMode,
-      backendId: selection.backendId,
-      fallbackReason: selection.fallbackReason,
+      graphId: graph.graphId,
+      rootTaskId: graph.rootTaskId,
+      executionMode: placement.executionMode,
+      backendId: placement.backendId,
+      workerClass: placement.workerClass,
+      routeReason: placement.routeReason,
+      requiredCapabilities: placement.requiredCapabilities,
+      fallbackEligible: placement.fallbackEligible,
+      fallbackReason: placement.fallbackReason,
     },
     'Selected backend for group execution',
   );
+  emitTerminalSystemEvent(
+    chatJid,
+    `执行开始：${graph.graphId} · ${placement.backendId}/${placement.workerClass}`,
+  );
 
   try {
-    const execution = beginExecution({
-      scopeType: 'group',
-      scopeId: group.folder,
-      backend: selection.backendId,
-      groupJid: chatJid,
-    });
     executionId = execution.executionId;
+    let effectiveExecutionId = execution.executionId;
+    let effectiveBackendId = placement.backendId;
 
     // Always stream through the wrapper so execution heartbeats and
     // session compatibility updates happen even when the caller does not
@@ -423,10 +546,27 @@ async function runAgent(
       if (output.status === 'error') {
         streamedError = output.error || 'Unknown error';
       }
+      if (output.result) {
+        streamedVisibleResult = true;
+      }
       await onOutput?.(output);
     };
 
-    const output = await backend.run(
+    const teamOrchestrationResult = await maybeRunEdgeTeamOrchestration({
+      group,
+      prompt,
+      chatJid,
+      isMain,
+      assistantName: ASSISTANT_NAME,
+      frameworkRun,
+      edgeWorker: frameworkWorkers.edge,
+      onOutput: wrappedOnOutput,
+    });
+    if (teamOrchestrationResult.handled) {
+      return teamOrchestrationResult.status;
+    }
+
+    let output = await backend.run(
       group,
       {
         prompt,
@@ -435,8 +575,9 @@ async function runAgent(
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
+        executionContext,
       },
-      usesContainer
+      usesHeavyWorker
         ? (execution) =>
             queue.registerProcess(
               execution.chatJid,
@@ -448,13 +589,119 @@ async function runAgent(
       wrappedOnOutput,
     );
 
+    const recovery = classifyRuntimeRecovery({
+      error: streamedError || output.error || '',
+      workerClass: placement.workerClass,
+      fallbackEligible: placement.fallbackEligible,
+      visibleOutputEmitted: streamedVisibleResult,
+    });
+
+    if (recovery.kind === 'fallback' && executionId) {
+      failExecution(
+        executionId,
+        streamedError || output.error || 'Unknown error',
+      );
+      emitTerminalSystemEvent(
+        chatJid,
+        `执行降级：${graph.graphId} · edge → heavy · ${recovery.reason}`,
+      );
+
+      if (sessionId) {
+        sessions[group.folder] = sessionId;
+        setSession(group.folder, sessionId);
+      } else {
+        delete sessions[group.folder];
+        deleteSession(group.folder);
+      }
+
+      const fallback = prepareHeavyFallbackExecution({
+        scope: {
+          scopeType: 'group',
+          scopeId: group.folder,
+          groupJid: chatJid,
+        },
+        taskNodeId: graph.rootTaskId,
+        baseWorkspaceVersion,
+        previousContext: executionContext,
+        reason: recovery.reason,
+      });
+
+      executionId = fallback.execution.executionId;
+      effectiveExecutionId = fallback.execution.executionId;
+      effectiveBackendId = 'container';
+      streamedError = null;
+      streamedVisibleResult = false;
+
+      output = await frameworkWorkers.container.run(
+        group,
+        {
+          prompt,
+          sessionId,
+          groupFolder: group.folder,
+          chatJid,
+          isMain,
+          assistantName: ASSISTANT_NAME,
+          executionContext: fallback.executionContext,
+        },
+        (execution) =>
+          queue.registerProcess(
+            execution.chatJid,
+            execution.process,
+            execution.executionName,
+            execution.groupFolder,
+          ),
+        wrappedOnOutput,
+      );
+    }
+
     if (output.newSessionId) {
       sessions[group.folder] = output.newSessionId;
       setSession(group.folder, output.newSessionId);
     }
 
+    if (output.result && !streamedVisibleResult) {
+      await onOutput?.(output);
+    }
+
+    await runShadowExecutionComparison({
+      selection: selectShadowExecution(
+        effectiveBackendId,
+        { prompt, script: undefined },
+        SHADOW_EXECUTION_MODE,
+      ),
+      backends: frameworkWorkers,
+      group,
+      input: {
+        prompt,
+        sessionId,
+        groupFolder: group.folder,
+        chatJid,
+        isMain,
+        assistantName: ASSISTANT_NAME,
+      },
+      primaryBackendId: effectiveBackendId,
+      primaryOutput: output,
+      scope: 'group',
+      scopeId: group.folder,
+      fallbackReason: placement.fallbackReason,
+    });
+
     const error = streamedError || output.error;
     if (output.status === 'error' || error) {
+      const finalRecovery = classifyRuntimeRecovery({
+        error: error || 'Unknown error',
+        workerClass: effectiveBackendId === 'container' ? 'heavy' : 'edge',
+        fallbackEligible: false,
+        visibleOutputEmitted: streamedVisibleResult,
+      });
+
+      if (effectiveExecutionId) {
+        failExecution(effectiveExecutionId, error || 'Unknown error');
+      }
+      if (finalRecovery.kind === 'replan') {
+        markTaskNodeForReplan(graph.rootTaskId, finalRecovery.reason);
+      }
+
       // Detect stale/corrupt session — clear it so the next retry starts fresh.
       // The session .jsonl can go missing after a crash mid-write, manual
       // deletion, or disk-full. The existing backoff in group-queue.ts
@@ -473,23 +720,58 @@ async function runAgent(
         deleteSession(group.folder);
       }
 
-      failExecution(executionId, error || 'Unknown error');
-      logger.error({ group: group.name, error }, 'Container agent error');
+      failRootTaskGraph(
+        graph.graphId,
+        graph.rootTaskId,
+        error || 'Unknown error',
+      );
+      emitTerminalSystemEvent(
+        chatJid,
+        `执行失败：${graph.graphId} · ${error || 'Unknown error'}`,
+      );
+      logger.error(
+        { group: group.name, error },
+        'Heavy worker execution error',
+      );
       return 'error';
     }
 
-    commitExecution(executionId);
-    completeExecution(executionId);
+    commitExecution(effectiveExecutionId);
+    completeExecution(effectiveExecutionId);
+    completeRootTaskGraph(graph.graphId, graph.rootTaskId);
+    emitTerminalSystemEvent(chatJid, `执行完成：${graph.graphId}`);
     return 'success';
   } catch (err) {
-    if (executionId) {
-      failExecution(
-        executionId,
-        err instanceof Error ? err.message : String(err),
-      );
+    const error = err instanceof Error ? err.message : String(err);
+    const recovery = classifyRuntimeRecovery({
+      error,
+      workerClass: placement.workerClass,
+      fallbackEligible: placement.fallbackEligible,
+      visibleOutputEmitted: streamedVisibleResult,
+    });
+    if (executionId) failExecution(executionId, error);
+    if (recovery.kind === 'replan') {
+      markTaskNodeForReplan(graph.rootTaskId, recovery.reason);
     }
+    failRootTaskGraph(graph.graphId, graph.rootTaskId, error);
+    emitTerminalSystemEvent(chatJid, `执行失败：${graph.graphId} · ${error}`);
     logger.error({ group: group.name, err }, 'Agent error');
     return 'error';
+  } finally {
+    try {
+      syncObservabilitySnapshotToIpc(group.folder);
+    } catch (snapshotError) {
+      logger.warn(
+        {
+          group: group.name,
+          error:
+            snapshotError instanceof Error
+              ? snapshotError.message
+              : String(snapshotError),
+        },
+        'Failed to write framework observability snapshot',
+      );
+    }
   }
 }
 async function startMessageLoop(): Promise<void> {
@@ -608,6 +890,15 @@ function recoverPendingMessages(): void {
       MAX_MESSAGES_PER_PROMPT,
     );
     if (pending.length > 0) {
+      if (TERMINAL_CHANNEL_ENABLED && chatJid === TERMINAL_GROUP_JID) {
+        lastAgentTimestamp[chatJid] = pending[pending.length - 1].timestamp;
+        saveState();
+        logger.info(
+          { group: group.name, pendingCount: pending.length },
+          'Recovery: muted pending terminal messages',
+        );
+        continue;
+      }
       logger.info(
         { group: group.name, pendingCount: pending.length },
         'Recovery: found unprocessed messages',
@@ -626,6 +917,10 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
+  ensureTerminalCanaryGroup();
+  if (TERMINAL_CHANNEL_ENABLED && TERMINAL_RESET_SESSION_ON_START) {
+    resetTerminalSession('startup');
+  }
 
   if (
     deploymentRequiresContainerRuntime(
@@ -739,6 +1034,11 @@ async function main(): Promise<void> {
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
+    onResetSession: (groupFolder: string) => {
+      if (groupFolder === TERMINAL_GROUP_FOLDER) {
+        resetTerminalSession('command');
+      }
+    },
   };
 
   // Create and connect all registered channels.
@@ -764,7 +1064,7 @@ async function main(): Promise<void> {
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
-    backends: agentBackends,
+    backends: frameworkWorkers,
     defaultExecutionMode: DEFAULT_EXECUTION_MODE,
     registeredGroups: () => registeredGroups,
     getSessions: () => sessions,
@@ -783,14 +1083,19 @@ async function main(): Promise<void> {
         return;
       }
       const text = formatOutbound(rawText);
-      if (text) await channel.sendMessage(jid, text);
+      if (text) {
+        await channel.sendMessage(jid, text);
+        recordBotMessage(jid, text);
+      }
     },
   });
   startIpcWatcher({
     sendMessage: (jid, text) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      return channel.sendMessage(jid, text);
+      return channel
+        .sendMessage(jid, text)
+        .then(() => recordBotMessage(jid, text));
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
@@ -810,6 +1115,7 @@ async function main(): Promise<void> {
           group.folder,
           buildTaskSnapshots(tasks, group.folder, group.isMain === true),
         );
+        syncObservabilitySnapshotToIpc(group.folder);
       }
     },
   });

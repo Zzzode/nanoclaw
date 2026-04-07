@@ -22,18 +22,29 @@ import fs from 'fs';
 
 import {
   writeGroupsSnapshotToIpc,
+  writeObservabilitySnapshotToIpc,
   writeTasksSnapshotToIpc,
 } from './container-snapshot-writer.js';
+import { _initTestDatabase, createLogicalSession } from './db.js';
 import {
   buildGroupsSnapshotPayload,
   buildTaskSnapshots,
   type GroupSnapshot,
   type TaskSnapshotSource,
 } from './execution-snapshots.js';
+import { beginExecution, failExecution } from './execution-state.js';
+import { FRAMEWORK_POLICY_VERSION } from './framework-policy.js';
+import { buildFrameworkObservabilitySnapshot } from './framework-observability.js';
 import { resolveGroupIpcPath } from './group-folder.js';
+import {
+  createRootTaskGraph,
+  failRootTaskGraph,
+  requireReplanForTaskNode,
+} from './task-graph-state.js';
 
 describe('execution snapshots', () => {
   beforeEach(() => {
+    _initTestDatabase();
     vi.mocked(fs.mkdirSync).mockClear();
     vi.mocked(fs.writeFileSync).mockClear();
     vi.mocked(resolveGroupIpcPath).mockClear();
@@ -210,6 +221,100 @@ describe('execution snapshots', () => {
     });
     expect(fs.writeFileSync).toHaveBeenCalledWith(
       '/tmp/nanoclaw-ipc/alpha/available_groups.json',
+      JSON.stringify(payload, null, 2),
+    );
+  });
+
+  it('writes observability snapshots with governance, routes, and executions', () => {
+    createLogicalSession({
+      id: 'task:obs-ipc',
+      scopeType: 'task',
+      scopeId: 'obs-ipc',
+      providerSessionId: null,
+      status: 'active',
+      lastTurnId: null,
+      workspaceVersion: null,
+      groupMemoryVersion: null,
+      summaryRef: null,
+      recentMessagesWindow: null,
+      createdAt: '2026-04-07T00:00:00.000Z',
+      updatedAt: '2026-04-07T00:00:00.000Z',
+    });
+    createRootTaskGraph({
+      graphId: 'graph:obs-ipc',
+      rootTaskId: 'task:obs-ipc:root',
+      requestKind: 'group_turn',
+      scopeType: 'task',
+      scopeId: 'obs-ipc',
+      groupFolder: 'alpha',
+      chatJid: 'alpha@g.us',
+      logicalSessionId: 'task:obs-ipc',
+      workerClass: 'edge',
+      backendId: 'edge',
+      requiredCapabilities: ['message.send'],
+      routeReason: 'capability_match_edge',
+      policyVersion: FRAMEWORK_POLICY_VERSION,
+      fallbackEligible: true,
+      now: new Date('2026-04-07T00:00:00.000Z'),
+    });
+    const execution = beginExecution({
+      scopeType: 'task',
+      scopeId: 'obs-ipc',
+      backend: 'edge',
+      taskId: 'obs-ipc',
+      taskNodeId: 'task:obs-ipc:root',
+      now: new Date('2026-04-07T00:00:00.000Z'),
+    });
+    failExecution(
+      execution.executionId,
+      'Workspace version conflict: expected a, received b',
+      new Date('2026-04-07T00:00:01.000Z'),
+    );
+    requireReplanForTaskNode(
+      'task:obs-ipc:root',
+      'state_conflict_requires_heavy',
+      new Date('2026-04-07T00:00:01.000Z'),
+    );
+    failRootTaskGraph(
+      'graph:obs-ipc',
+      'task:obs-ipc:root',
+      'Workspace version conflict: expected a, received b',
+      new Date('2026-04-07T00:00:02.000Z'),
+    );
+
+    const payload = buildFrameworkObservabilitySnapshot({
+      groupFolder: 'alpha',
+      now: new Date('2026-04-07T00:01:00.000Z'),
+    });
+
+    expect(payload).toMatchObject({
+      scope: { kind: 'group', id: 'alpha' },
+      governance: {
+        totalGraphs: 1,
+        totalExecutions: 1,
+        edgeToHeavyFallbackRate: 0,
+        commitConflictRate: 1,
+      },
+      routes: [
+        expect.objectContaining({
+          taskId: 'task:obs-ipc:root',
+          fallbackTarget: 'replan',
+          fallbackReason: 'state_conflict_requires_heavy',
+        }),
+      ],
+      executions: [
+        expect.objectContaining({
+          backend: 'edge',
+          status: 'failed',
+          commitStatus: 'conflict',
+        }),
+      ],
+    });
+
+    writeObservabilitySnapshotToIpc('alpha', payload);
+
+    expect(fs.writeFileSync).toHaveBeenCalledWith(
+      '/tmp/nanoclaw-ipc/alpha/framework_observability.json',
       JSON.stringify(payload, null, 2),
     );
   });

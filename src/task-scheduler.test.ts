@@ -4,7 +4,10 @@ import { AgentBackend } from './agent-backend.js';
 import {
   _initTestDatabase,
   createTask,
+  deleteTask,
   getLogicalSession,
+  getTaskGraph,
+  getTaskNode,
   getTaskById,
   listExecutionStates,
 } from './db.js';
@@ -220,6 +223,19 @@ describe('task scheduler', () => {
       status: 'completed',
       taskId: 'task-group-context',
     });
+    const graph = getTaskGraph(`graph:${executions[0].turnId}`);
+    expect(graph).toMatchObject({
+      requestKind: 'scheduled_task',
+      scopeType: 'group',
+      scopeId: 'team_alpha',
+      status: 'completed',
+    });
+    expect(getTaskNode(graph!.rootTaskId)).toMatchObject({
+      graphId: graph!.graphId,
+      status: 'completed',
+      workerClass: 'heavy',
+      backendId: 'container',
+    });
   });
 
   it('records isolated task executions with a dedicated logical session', async () => {
@@ -290,6 +306,234 @@ describe('task scheduler', () => {
     });
   });
 
+  it('only forwards the final scheduled-task output once', async () => {
+    createTask({
+      id: 'task-final-only',
+      group_folder: 'team_alpha',
+      chat_jid: 'room@g.us',
+      prompt: 'run noisy task',
+      schedule_type: 'once',
+      schedule_value: '2026-04-03T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-04-03T00:00:00.000Z',
+    });
+
+    backendRun.mockImplementation(
+      async (_group, _input, _started, onOutput) => {
+        await onOutput?.({
+          status: 'success',
+          result: '正在调用工具：task.create',
+        });
+        await onOutput?.({
+          status: 'success',
+          result: '任务已创建，taskId=task-123',
+        });
+        return {
+          status: 'success',
+          result: '任务创建成功',
+        };
+      },
+    );
+
+    const queue = {
+      closeStdin: vi.fn(),
+      enqueueTask: vi.fn(
+        async (_groupJid: string, _taskId: string, fn: () => Promise<void>) => {
+          await fn();
+        },
+      ),
+      registerProcess: vi.fn(),
+      notifyIdle: vi.fn(),
+    } as any;
+    const sendMessage = vi.fn(async () => {});
+
+    startSchedulerLoop({
+      backends: { container: backendStub, edge: edgeBackendStub },
+      defaultExecutionMode: 'container',
+      registeredGroups: () => ({
+        'room@g.us': {
+          name: 'Team Alpha',
+          folder: 'team_alpha',
+          trigger: '@Andy',
+          added_at: '2026-04-03T00:00:00.000Z',
+        },
+      }),
+      getSessions: () => ({}),
+      queue,
+      sendMessage,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith('room@g.us', '任务创建成功');
+  });
+
+  it('does not forward tool-progress-only scheduled-task output', async () => {
+    createTask({
+      id: 'task-progress-only',
+      group_folder: 'team_alpha',
+      chat_jid: 'room@g.us',
+      prompt: 'run noisy task',
+      schedule_type: 'once',
+      schedule_value: '2026-04-03T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-04-03T00:00:00.000Z',
+    });
+
+    backendRun.mockImplementation(
+      async (_group, _input, _started, onOutput) => {
+        await onOutput?.({
+          status: 'success',
+          result: '正在调用工具：workspace.read',
+        });
+        return {
+          status: 'success',
+          result: null,
+        };
+      },
+    );
+
+    const queue = {
+      closeStdin: vi.fn(),
+      enqueueTask: vi.fn(
+        async (_groupJid: string, _taskId: string, fn: () => Promise<void>) => {
+          await fn();
+        },
+      ),
+      registerProcess: vi.fn(),
+      notifyIdle: vi.fn(),
+    } as any;
+    const sendMessage = vi.fn(async () => {});
+
+    startSchedulerLoop({
+      backends: { container: backendStub, edge: edgeBackendStub },
+      defaultExecutionMode: 'container',
+      registeredGroups: () => ({
+        'room@g.us': {
+          name: 'Team Alpha',
+          folder: 'team_alpha',
+          trigger: '@Andy',
+          added_at: '2026-04-03T00:00:00.000Z',
+        },
+      }),
+      getSessions: () => ({}),
+      queue,
+      sendMessage,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('defers due tasks while foreground work is pending for the same group', async () => {
+    createTask({
+      id: 'task-foreground-blocked',
+      group_folder: 'team_alpha',
+      chat_jid: 'room@g.us',
+      prompt: 'run later',
+      schedule_type: 'once',
+      schedule_value: '2026-04-03T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-04-03T00:00:00.000Z',
+    });
+
+    const queue = {
+      closeStdin: vi.fn(),
+      enqueueTask: vi.fn(),
+      hasForegroundWork: vi.fn(() => true),
+      notifyIdle: vi.fn(),
+    } as any;
+
+    startSchedulerLoop({
+      backends: { container: backendStub, edge: edgeBackendStub },
+      defaultExecutionMode: 'container',
+      registeredGroups: () => ({
+        'room@g.us': {
+          name: 'Team Alpha',
+          folder: 'team_alpha',
+          trigger: '@Andy',
+          added_at: '2026-04-03T00:00:00.000Z',
+        },
+      }),
+      getSessions: () => ({}),
+      queue,
+      sendMessage: async () => {},
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(queue.hasForegroundWork).toHaveBeenCalledWith('room@g.us');
+    expect(queue.enqueueTask).not.toHaveBeenCalled();
+    expect(getTaskById('task-foreground-blocked')?.status).toBe('active');
+  });
+
+  it('gracefully skips finalization when a running task is deleted', async () => {
+    createTask({
+      id: 'task-delete-during-run',
+      group_folder: 'team_alpha',
+      chat_jid: 'room@g.us',
+      prompt: 'delete me while running',
+      schedule_type: 'interval',
+      schedule_value: '300000',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-04-03T00:00:00.000Z',
+    });
+
+    backendRun.mockImplementation(
+      async (_group, _input, _started, onOutput) => {
+        deleteTask('task-delete-during-run');
+        await onOutput?.({
+          status: 'success',
+          result: 'deleted while running',
+        });
+        return { status: 'success', result: 'deleted while running' };
+      },
+    );
+
+    const queue = {
+      closeStdin: vi.fn(),
+      enqueueTask: vi.fn(
+        async (_groupJid: string, _taskId: string, fn: () => Promise<void>) => {
+          await fn();
+        },
+      ),
+      hasForegroundWork: vi.fn(() => false),
+      notifyIdle: vi.fn(),
+    } as any;
+    const sendMessage = vi.fn(async () => {});
+
+    startSchedulerLoop({
+      backends: { container: backendStub, edge: edgeBackendStub },
+      defaultExecutionMode: 'container',
+      registeredGroups: () => ({
+        'room@g.us': {
+          name: 'Team Alpha',
+          folder: 'team_alpha',
+          trigger: '@Andy',
+          added_at: '2026-04-03T00:00:00.000Z',
+        },
+      }),
+      getSessions: () => ({}),
+      queue,
+      sendMessage,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(getTaskById('task-delete-during-run')).toBeUndefined();
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   it('routes auto groups without scripts to edge backend', async () => {
     createTask({
       id: 'task-edge-auto',
@@ -319,6 +563,7 @@ describe('task scheduler', () => {
           await fn();
         },
       ),
+      registerProcess: vi.fn(),
       notifyIdle: vi.fn(),
     } as any;
     const sendMessage = vi.fn(async () => {});
@@ -350,6 +595,105 @@ describe('task scheduler', () => {
     const executions = listExecutionStates();
     expect(executions).toHaveLength(1);
     expect(executions[0]?.backend).toBe('edge');
+  });
+
+  it('falls back edge task failures to container for fallback-eligible auto groups', async () => {
+    createTask({
+      id: 'task-edge-fallback',
+      group_folder: 'team_alpha',
+      chat_jid: 'room@g.us',
+      prompt: 'edge first task',
+      schedule_type: 'once',
+      schedule_value: '2026-04-03T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-04-03T00:00:00.000Z',
+    });
+
+    edgeBackendRun.mockResolvedValueOnce({
+      status: 'error',
+      result: null,
+      error: 'Edge execution exceeded deadline of 100ms.',
+    });
+    backendRun.mockImplementationOnce(
+      async (_group, _input, started, onOutput) => {
+        await started?.({
+          chatJid: 'room@g.us',
+          process: {} as any,
+          executionName: 'nanoclaw-fallback-task',
+          groupFolder: 'team_alpha',
+        });
+        await onOutput?.({
+          status: 'success',
+          result: 'heavy fallback result',
+        });
+        return { status: 'success', result: 'heavy fallback result' };
+      },
+    );
+
+    const queue = {
+      closeStdin: vi.fn(),
+      enqueueTask: vi.fn(
+        async (_groupJid: string, _taskId: string, fn: () => Promise<void>) => {
+          await fn();
+        },
+      ),
+      registerProcess: vi.fn(),
+      notifyIdle: vi.fn(),
+    } as any;
+    const sendMessage = vi.fn(async () => {});
+
+    startSchedulerLoop({
+      backends: { container: backendStub, edge: edgeBackendStub },
+      defaultExecutionMode: 'auto',
+      registeredGroups: () => ({
+        'room@g.us': {
+          name: 'Team Alpha',
+          folder: 'team_alpha',
+          trigger: '@Andy',
+          added_at: '2026-04-03T00:00:00.000Z',
+          executionMode: 'auto',
+        },
+      }),
+      getSessions: () => ({}),
+      queue,
+      sendMessage,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(edgeBackendRun).toHaveBeenCalledTimes(1);
+    expect(backendRun).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith(
+      'room@g.us',
+      'heavy fallback result',
+    );
+
+    const executions = listExecutionStates();
+    expect(executions).toHaveLength(2);
+    expect(executions[0]).toMatchObject({
+      backend: 'edge',
+      status: 'failed',
+      error: 'Edge execution exceeded deadline of 100ms.',
+    });
+    expect(executions[1]).toMatchObject({
+      backend: 'container',
+      status: 'completed',
+      error: null,
+    });
+
+    const graph = getTaskGraph(`graph:${executions[0].turnId}`);
+    expect(graph).toMatchObject({
+      status: 'completed',
+    });
+    expect(getTaskNode(graph!.rootTaskId)).toMatchObject({
+      status: 'completed',
+      workerClass: 'heavy',
+      backendId: 'container',
+      fallbackTarget: 'heavy',
+      fallbackReason: 'edge_timeout',
+    });
   });
 
   it('routes auto groups with scripts to container backend', async () => {
@@ -387,6 +731,7 @@ describe('task scheduler', () => {
           await fn();
         },
       ),
+      registerProcess: vi.fn(),
       notifyIdle: vi.fn(),
     } as any;
     const sendMessage = vi.fn(async () => {});
@@ -414,6 +759,7 @@ describe('task scheduler', () => {
     expect(backendRun).toHaveBeenCalledTimes(1);
     expect(edgeBackendRun).not.toHaveBeenCalled();
     expect(onExecutionStarted).toHaveBeenCalledTimes(1);
+    expect(queue.notifyIdle).toHaveBeenCalledWith('room@g.us', 'background');
 
     const executions = listExecutionStates();
     expect(executions).toHaveLength(1);

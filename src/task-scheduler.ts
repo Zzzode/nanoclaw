@@ -5,37 +5,59 @@ import {
   AgentBackend,
   AgentRunOutput,
   ExecutionStartedCallback,
+  StartedExecution,
 } from './agent-backend.js';
-import { selectAgentBackend } from './backend-selection.js';
 import {
   ASSISTANT_NAME,
   DEFAULT_EXECUTION_MODE,
   SCHEDULER_POLL_INTERVAL,
+  SHADOW_EXECUTION_MODE,
   TIMEZONE,
 } from './config.js';
-import { writeTasksSnapshotToIpc } from './container-snapshot-writer.js';
+import {
+  syncObservabilitySnapshotToIpc,
+  writeTasksSnapshotToIpc,
+} from './container-snapshot-writer.js';
 import {
   getAllTasks,
   getDueTasks,
   getTaskById,
   logTaskRun,
   setSession,
+  updateLogicalSession,
   updateTask,
   updateTaskAfterRun,
 } from './db.js';
 import {
-  beginExecution,
   commitExecution,
   completeExecution,
   failExecution,
   heartbeatExecution,
+  markExpiredExecutionsLost,
+  requestExecutionCancel,
 } from './execution-state.js';
 import { buildTaskSnapshots } from './execution-snapshots.js';
 import { type AgentBackendId, type ExecutionMode } from './execution-mode.js';
+import { createFrameworkRunContext } from './framework-orchestrator.js';
+import {
+  classifyRuntimeRecovery,
+  markTaskNodeForReplan,
+  prepareHeavyFallbackExecution,
+} from './framework-recovery.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
+import {
+  runShadowExecutionComparison,
+  selectShadowExecution,
+} from './shadow-execution.js';
+import {
+  completeRootTaskGraph,
+  failRootTaskGraph,
+} from './task-graph-state.js';
+import { registerTaskRuntimeController } from './task-control.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
+import { emitTerminalSystemEvent } from './channels/terminal.js';
 
 /**
  * Compute the next run time for a recurring task, anchored to the
@@ -88,11 +110,35 @@ export interface SchedulerDependencies {
   sendMessage: (jid: string, text: string) => Promise<void>;
 }
 
+function shouldSurfaceScheduledTaskOutput(
+  text: string | null | undefined,
+): text is string {
+  if (typeof text !== 'string') return false;
+  const normalized = text.trim();
+  if (!normalized) return false;
+  if (normalized.startsWith('正在调用工具：')) return false;
+  return true;
+}
+
 async function runTask(
   task: ScheduledTask,
   deps: SchedulerDependencies,
 ): Promise<void> {
   const startTime = Date.now();
+  const currentTask = getTaskById(task.id);
+  if (!currentTask || currentTask.status !== 'active') {
+    logger.info(
+      {
+        taskId: task.id,
+        exists: Boolean(currentTask),
+        status: currentTask?.status ?? 'deleted',
+      },
+      'Skipping scheduled task because it is no longer runnable',
+    );
+    return;
+  }
+
+  task = currentTask;
   let groupDir: string;
   try {
     groupDir = resolveGroupFolderPath(task.group_folder);
@@ -117,9 +163,16 @@ async function runTask(
   fs.mkdirSync(groupDir, { recursive: true });
 
   logger.info(
-    { taskId: task.id, group: task.group_folder },
+    {
+      taskId: task.id,
+      group: task.group_folder,
+      status: 'running',
+      scheduleValue: task.schedule_value,
+      nextRun: task.next_run,
+    },
     'Running scheduled task',
   );
+  emitTerminalSystemEvent(task.chat_jid, `任务开始：${task.id}`);
 
   const groups = deps.registeredGroups();
   const group = Object.values(groups).find(
@@ -143,27 +196,54 @@ async function runTask(
   }
 
   const isMain = group.isMain === true;
-  const selection = selectAgentBackend(
+  const scopeType = task.context_mode === 'group' ? 'group' : 'task';
+  const scopeId = task.context_mode === 'group' ? task.group_folder : task.id;
+  const frameworkRun = createFrameworkRunContext({
+    requestKind: 'scheduled_task',
     group,
-    { script: task.script || undefined },
-    deps.defaultExecutionMode,
-  );
-  const usesContainer = selection.backendId === 'container';
-  const backend = deps.backends[selection.backendId];
+    input: {
+      prompt: task.prompt,
+      script: task.script || undefined,
+      chatJid: task.chat_jid,
+    },
+    defaultExecutionMode: deps.defaultExecutionMode,
+    executionScope: {
+      scopeType,
+      scopeId,
+      groupJid: task.chat_jid,
+      taskId: task.id,
+    },
+  });
+  const {
+    placement,
+    graph,
+    execution,
+    executionContext,
+    baseWorkspaceVersion,
+  } = frameworkRun;
+  const usesHeavyWorker = placement.workerClass === 'heavy';
+  const backend = deps.backends[placement.backendId];
 
-  if (usesContainer) {
+  if (usesHeavyWorker) {
     writeTasksSnapshotToIpc(
       task.group_folder,
       buildTaskSnapshots(getAllTasks(), task.group_folder, isMain),
     );
+    syncObservabilitySnapshotToIpc(task.group_folder);
   }
 
   logger.debug(
     {
       taskId: task.id,
-      executionMode: selection.executionMode,
-      backendId: selection.backendId,
-      fallbackReason: selection.fallbackReason,
+      graphId: graph.graphId,
+      rootTaskId: graph.rootTaskId,
+      executionMode: placement.executionMode,
+      backendId: placement.backendId,
+      workerClass: placement.workerClass,
+      routeReason: placement.routeReason,
+      requiredCapabilities: placement.requiredCapabilities,
+      fallbackEligible: placement.fallbackEligible,
+      fallbackReason: placement.fallbackReason,
     },
     'Selected backend for scheduled task',
   );
@@ -172,41 +252,64 @@ async function runTask(
   let error: string | null = null;
   let executionId: string | null = null;
   let streamedError: string | null = null;
+  let latestSuccessfulOutput: string | null = null;
+  let sentVisibleMessage = false;
 
   // Keep current behavior: only group-context tasks resume the group's
   // provider session; isolated tasks still execute as single-turn runs.
   const sessions = deps.getSessions();
   const sessionId =
     task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
-  const scopeType = task.context_mode === 'group' ? 'group' : 'task';
-  const scopeId = task.context_mode === 'group' ? task.group_folder : task.id;
 
   // After the task produces a result, close the container promptly.
   // Tasks are single-turn — no need to wait IDLE_TIMEOUT (30 min) for the
   // query loop to time out. A short delay handles any final MCP calls.
   const TASK_CLOSE_DELAY_MS = 10000;
   let closeTimer: ReturnType<typeof setTimeout> | null = null;
+  let taskDeletedDuringRun = false;
+
+  const refreshTaskState = () => getTaskById(task.id);
+  const markDeletedDuringRun = () => {
+    const latestTask = refreshTaskState();
+    if (latestTask) return false;
+    taskDeletedDuringRun = true;
+    if (executionId) {
+      requestExecutionCancel(executionId);
+    }
+    if (usesHeavyWorker) {
+      deps.queue.closeStdin(task.chat_jid, 'background');
+    }
+    return true;
+  };
 
   const scheduleClose = () => {
-    if (!usesContainer) return;
+    if (!usesHeavyWorker) return;
     if (closeTimer) return; // already scheduled
     closeTimer = setTimeout(() => {
-      logger.debug({ taskId: task.id }, 'Closing task container after result');
-      deps.queue.closeStdin(task.chat_jid);
+      logger.debug({ taskId: task.id }, 'Closing heavy worker after result');
+      deps.queue.closeStdin(task.chat_jid, 'background');
     }, TASK_CLOSE_DELAY_MS);
   };
 
   try {
-    const execution = beginExecution({
-      scopeType,
-      scopeId,
-      backend: selection.backendId,
-      groupJid: task.chat_jid,
-      taskId: task.id,
-    });
     executionId = execution.executionId;
+    let effectiveExecutionId = execution.executionId;
+    let effectiveBackendId = placement.backendId;
 
-    const output = await backend.run(
+    const onScheduledExecutionStarted = usesHeavyWorker
+      ? (execution: StartedExecution) => {
+          deps.queue.registerProcess(
+            execution.chatJid,
+            execution.process,
+            execution.executionName,
+            execution.groupFolder,
+            'background',
+          );
+          deps.onExecutionStarted?.(execution);
+        }
+      : undefined;
+
+    let output = await backend.run(
       group,
       {
         prompt: task.prompt,
@@ -217,67 +320,253 @@ async function runTask(
         isScheduledTask: true,
         assistantName: ASSISTANT_NAME,
         script: task.script || undefined,
+        executionContext,
       },
-      usesContainer ? deps.onExecutionStarted : undefined,
+      onScheduledExecutionStarted,
       async (streamedOutput: AgentRunOutput) => {
+        if (markDeletedDuringRun()) {
+          return;
+        }
         if (executionId) heartbeatExecution(executionId);
-        if (task.context_mode === 'group' && streamedOutput.newSessionId) {
-          sessions[task.group_folder] = streamedOutput.newSessionId;
-          setSession(task.group_folder, streamedOutput.newSessionId);
+        if (streamedOutput.newSessionId) {
+          if (task.context_mode === 'group') {
+            sessions[task.group_folder] = streamedOutput.newSessionId;
+            setSession(task.group_folder, streamedOutput.newSessionId);
+          } else {
+            updateLogicalSession(execution.logicalSessionId, {
+              providerSessionId: streamedOutput.newSessionId,
+              status: 'active',
+            });
+          }
         }
         if (streamedOutput.status === 'error') {
           streamedError = streamedOutput.error || 'Unknown error';
         }
-        if (streamedOutput.result) {
+        if (shouldSurfaceScheduledTaskOutput(streamedOutput.result)) {
           result = streamedOutput.result;
-          // Forward result to user (sendMessage handles formatting)
-          await deps.sendMessage(task.chat_jid, streamedOutput.result);
+          latestSuccessfulOutput = streamedOutput.result;
           scheduleClose();
         }
-        if (usesContainer && streamedOutput.status === 'success') {
-          deps.queue.notifyIdle(task.chat_jid);
+        if (usesHeavyWorker && streamedOutput.status === 'success') {
+          deps.queue.notifyIdle(task.chat_jid, 'background');
           scheduleClose(); // Close promptly even when result is null (e.g. IPC-only tasks)
         }
       },
     );
 
-    if (closeTimer) clearTimeout(closeTimer);
+    const recovery = classifyRuntimeRecovery({
+      error: streamedError || output.error || '',
+      workerClass: placement.workerClass,
+      fallbackEligible: placement.fallbackEligible,
+    });
 
-    if (task.context_mode === 'group' && output.newSessionId) {
-      sessions[task.group_folder] = output.newSessionId;
-      setSession(task.group_folder, output.newSessionId);
+    if (recovery.kind === 'fallback' && executionId) {
+      failExecution(
+        executionId,
+        streamedError || output.error || 'Unknown error',
+      );
+      emitTerminalSystemEvent(
+        task.chat_jid,
+        `执行降级：${graph.graphId} · edge → heavy · ${recovery.reason}`,
+      );
+
+      const fallback = prepareHeavyFallbackExecution({
+        scope: {
+          scopeType,
+          scopeId,
+          groupJid: task.chat_jid,
+          taskId: task.id,
+        },
+        taskNodeId: graph.rootTaskId,
+        baseWorkspaceVersion,
+        previousContext: executionContext,
+        reason: recovery.reason,
+      });
+
+      executionId = fallback.execution.executionId;
+      effectiveExecutionId = fallback.execution.executionId;
+      effectiveBackendId = 'container';
+      streamedError = null;
+      result = null;
+      latestSuccessfulOutput = null;
+
+      output = await deps.backends.container.run(
+        group,
+        {
+          prompt: task.prompt,
+          sessionId,
+          groupFolder: task.group_folder,
+          chatJid: task.chat_jid,
+          isMain,
+          isScheduledTask: true,
+          assistantName: ASSISTANT_NAME,
+          script: task.script || undefined,
+          executionContext: fallback.executionContext,
+        },
+        (execution) => {
+          deps.queue.registerProcess(
+            execution.chatJid,
+            execution.process,
+            execution.executionName,
+            execution.groupFolder,
+            'background',
+          );
+          deps.onExecutionStarted?.(execution);
+        },
+        async (streamedOutput: AgentRunOutput) => {
+          if (markDeletedDuringRun()) {
+            return;
+          }
+          if (executionId) heartbeatExecution(executionId);
+          if (streamedOutput.newSessionId) {
+            if (task.context_mode === 'group') {
+              sessions[task.group_folder] = streamedOutput.newSessionId;
+              setSession(task.group_folder, streamedOutput.newSessionId);
+            } else {
+              updateLogicalSession(fallback.execution.logicalSessionId, {
+                providerSessionId: streamedOutput.newSessionId,
+                status: 'active',
+              });
+            }
+          }
+          if (streamedOutput.status === 'error') {
+            streamedError = streamedOutput.error || 'Unknown error';
+          }
+          if (shouldSurfaceScheduledTaskOutput(streamedOutput.result)) {
+            result = streamedOutput.result;
+            latestSuccessfulOutput = streamedOutput.result;
+            scheduleClose();
+          }
+          deps.queue.notifyIdle(task.chat_jid, 'background');
+          scheduleClose();
+        },
+      );
+    }
+
+    if (closeTimer) clearTimeout(closeTimer);
+    if (markDeletedDuringRun()) {
+      error = 'Task deleted before completion.';
+    }
+
+    if (!taskDeletedDuringRun && output.newSessionId) {
+      if (task.context_mode === 'group') {
+        sessions[task.group_folder] = output.newSessionId;
+        setSession(task.group_folder, output.newSessionId);
+      } else {
+        updateLogicalSession(execution.logicalSessionId, {
+          providerSessionId: output.newSessionId,
+          status: 'active',
+        });
+      }
+    }
+
+    if (!taskDeletedDuringRun) {
+      await runShadowExecutionComparison({
+        selection: selectShadowExecution(
+          effectiveBackendId,
+          { prompt: task.prompt, script: task.script || undefined },
+          SHADOW_EXECUTION_MODE,
+        ),
+        backends: deps.backends,
+        group,
+        input: {
+          prompt: task.prompt,
+          sessionId,
+          groupFolder: task.group_folder,
+          chatJid: task.chat_jid,
+          isMain,
+          isScheduledTask: true,
+          assistantName: ASSISTANT_NAME,
+          script: task.script || undefined,
+        },
+        primaryBackendId: effectiveBackendId,
+        primaryOutput: output,
+        scope: 'task',
+        scopeId: task.id,
+        fallbackReason: placement.fallbackReason,
+      });
     }
 
     error = streamedError || output.error || error;
     if (output.status === 'error') {
       error = error || 'Unknown error';
-    } else if (output.result) {
+    } else if (
+      !taskDeletedDuringRun &&
+      shouldSurfaceScheduledTaskOutput(output.result)
+    ) {
       // Result was already forwarded to the user via the streaming callback above
       result = output.result;
     }
 
     if (error) {
-      failExecution(executionId, error);
+      const finalRecovery = classifyRuntimeRecovery({
+        error,
+        workerClass: effectiveBackendId === 'container' ? 'heavy' : 'edge',
+        fallbackEligible: false,
+      });
+
+      failExecution(effectiveExecutionId, error);
+      if (finalRecovery.kind === 'replan') {
+        markTaskNodeForReplan(graph.rootTaskId, finalRecovery.reason);
+      }
+      failRootTaskGraph(graph.graphId, graph.rootTaskId, error);
     } else {
-      commitExecution(executionId);
-      completeExecution(executionId);
+      commitExecution(effectiveExecutionId);
+      completeExecution(effectiveExecutionId);
+      completeRootTaskGraph(graph.graphId, graph.rootTaskId);
+      if (!taskDeletedDuringRun && (output.result || latestSuccessfulOutput)) {
+        sentVisibleMessage = true;
+        await deps.sendMessage(
+          task.chat_jid,
+          output.result || latestSuccessfulOutput!,
+        );
+      }
     }
 
     logger.info(
-      { taskId: task.id, durationMs: Date.now() - startTime },
+      {
+        taskId: task.id,
+        durationMs: Date.now() - startTime,
+        status: error ? 'error' : 'completed',
+      },
       'Task completed',
     );
   } catch (err) {
     if (closeTimer) clearTimeout(closeTimer);
     error = err instanceof Error ? err.message : String(err);
-    if (executionId) {
-      failExecution(executionId, error);
+    const recovery = classifyRuntimeRecovery({
+      error,
+      workerClass: placement.workerClass,
+      fallbackEligible: placement.fallbackEligible,
+    });
+    if (executionId) failExecution(executionId, error);
+    if (recovery.kind === 'replan') {
+      markTaskNodeForReplan(graph.rootTaskId, recovery.reason);
     }
+    failRootTaskGraph(graph.graphId, graph.rootTaskId, error);
     logger.error({ taskId: task.id, error }, 'Task failed');
   }
 
-  const durationMs = Date.now() - startTime;
+  const latestTask = getTaskById(task.id);
+  if (!latestTask) {
+    logger.info(
+      {
+        taskId: task.id,
+        durationMs: Date.now() - startTime,
+        status: 'deleted',
+      },
+      'Skipping task finalization because task was deleted during execution',
+    );
+    return;
+  }
 
+  if (error) {
+    emitTerminalSystemEvent(task.chat_jid, `任务失败：${task.id}`);
+  } else if (!sentVisibleMessage) {
+    emitTerminalSystemEvent(task.chat_jid, `任务完成：${task.id}`);
+  }
+
+  const durationMs = Date.now() - startTime;
   logTaskRun({
     task_id: task.id,
     run_at: new Date().toISOString(),
@@ -287,13 +576,14 @@ async function runTask(
     error,
   });
 
-  const nextRun = computeNextRun(task);
+  const nextRun = computeNextRun(latestTask);
   const resultSummary = error
     ? `Error: ${error}`
     : result
       ? result.slice(0, 200)
       : 'Completed';
   updateTaskAfterRun(task.id, nextRun, resultSummary);
+  syncObservabilitySnapshotToIpc(task.group_folder);
 }
 let schedulerRunning = false;
 
@@ -304,12 +594,18 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
   }
   schedulerRunning = true;
   logger.info('Scheduler loop started');
+  registerTaskRuntimeController({
+    cancelTask: ({ chatJid, taskId }) => {
+      deps.queue.cancelTask?.(chatJid, taskId);
+    },
+  });
 
   const effectiveDefaultExecutionMode =
     deps.defaultExecutionMode || DEFAULT_EXECUTION_MODE;
 
   const loop = async () => {
     try {
+      markExpiredExecutionsLost();
       const dueTasks = getDueTasks();
       if (dueTasks.length > 0) {
         logger.info({ count: dueTasks.length }, 'Found due tasks');
@@ -319,6 +615,16 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
         // Re-check task status in case it was paused/cancelled
         const currentTask = getTaskById(task.id);
         if (!currentTask || currentTask.status !== 'active') {
+          continue;
+        }
+        if (
+          typeof deps.queue.hasForegroundWork === 'function' &&
+          deps.queue.hasForegroundWork(currentTask.chat_jid)
+        ) {
+          logger.debug(
+            { taskId: currentTask.id, groupJid: currentTask.chat_jid },
+            'Deferring scheduled task because foreground work is pending',
+          );
           continue;
         }
 
@@ -342,4 +648,5 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
 /** @internal - for tests only. */
 export function _resetSchedulerLoopForTests(): void {
   schedulerRunning = false;
+  registerTaskRuntimeController(null);
 }

@@ -2,6 +2,10 @@ import fs from 'fs';
 import path from 'path';
 
 import { GroupsSnapshotPayload, TaskSnapshot } from './execution-snapshots.js';
+import {
+  buildFrameworkObservabilitySnapshot,
+  type FrameworkObservabilitySnapshot,
+} from './framework-observability.js';
 import { resolveGroupIpcPath } from './group-folder.js';
 
 export function writeTasksSnapshotToIpc(
@@ -24,4 +28,25 @@ export function writeGroupsSnapshotToIpc(
 
   const groupsFile = path.join(groupIpcDir, 'available_groups.json');
   fs.writeFileSync(groupsFile, JSON.stringify(payload, null, 2));
+}
+
+export function writeObservabilitySnapshotToIpc(
+  groupFolder: string,
+  payload: FrameworkObservabilitySnapshot,
+): void {
+  const groupIpcDir = resolveGroupIpcPath(groupFolder);
+  fs.mkdirSync(groupIpcDir, { recursive: true });
+
+  const observabilityFile = path.join(
+    groupIpcDir,
+    'framework_observability.json',
+  );
+  fs.writeFileSync(observabilityFile, JSON.stringify(payload, null, 2));
+}
+
+export function syncObservabilitySnapshotToIpc(groupFolder: string): void {
+  writeObservabilitySnapshotToIpc(
+    groupFolder,
+    buildFrameworkObservabilitySnapshot({ groupFolder }),
+  );
 }

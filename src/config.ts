@@ -1,15 +1,38 @@
-import os from 'os';
 import path from 'path';
 
 import { readEnvFile } from './env.js';
 import { resolveExecutionMode } from './execution-mode.js';
+import { resolveShadowExecutionMode } from './shadow-execution.js';
 import { isValidTimezone } from './timezone.js';
 
 // Read config values from .env (falls back to process.env).
 const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
+  'CONTAINER_ANTHROPIC_BASE_URL',
+  'CONTAINER_ANTHROPIC_API_KEY',
+  'CONTAINER_ANTHROPIC_MODEL',
   'DEFAULT_EXECUTION_MODE',
+  'EDGEJS_BIN',
+  'EDGE_API_BASE_URL',
+  'EDGE_API_KEY',
+  'EDGE_MODEL',
+  'EDGE_ANTHROPIC_API_BASE_URL',
+  'EDGE_ANTHROPIC_API_KEY',
+  'EDGE_ANTHROPIC_MODEL',
+  'EDGE_RUNNER_MODE',
+  'EDGE_RUNNER_PROVIDER',
+  'EDGE_ENABLE_TOOLS',
+  'EDGE_DISABLE_FALLBACK',
+  'SHADOW_EXECUTION_MODE',
+  'TERMINAL_CHANNEL',
+  'TERMINAL_GROUP_EXECUTION_MODE',
+  'TERMINAL_GROUP_FOLDER',
+  'TERMINAL_GROUP_JID',
+  'TERMINAL_GROUP_NAME',
+  'TERMINAL_RESET_SESSION_ON_START',
+  'TERMINAL_USER_JID',
+  'TERMINAL_USER_NAME',
   'ONECLI_URL',
   'TZ',
 ]);
@@ -24,7 +47,10 @@ export const SCHEDULER_POLL_INTERVAL = 60000;
 
 // Absolute paths needed for container mounts
 const PROJECT_ROOT = process.cwd();
-const HOME_DIR = process.env.HOME || os.homedir();
+function resolveHomeDir(): string {
+  return process.env.HOME || PROJECT_ROOT;
+}
+const HOME_DIR = resolveHomeDir();
 
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers
 export const MOUNT_ALLOWLIST_PATH = path.join(
@@ -39,16 +65,92 @@ export const SENDER_ALLOWLIST_PATH = path.join(
   'nanoclaw',
   'sender-allowlist.json',
 );
-export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
-export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
-export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
+export const STORE_DIR = path.resolve(
+  process.env.NANOCLAW_STORE_DIR || path.join(PROJECT_ROOT, 'store'),
+);
+export const GROUPS_DIR = path.resolve(
+  process.env.NANOCLAW_GROUPS_DIR || path.join(PROJECT_ROOT, 'groups'),
+);
+export const DATA_DIR = path.resolve(
+  process.env.NANOCLAW_DATA_DIR || path.join(PROJECT_ROOT, 'data'),
+);
 
 export const CONTAINER_IMAGE =
   process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
+export const CONTAINER_ANTHROPIC_BASE_URL =
+  process.env.CONTAINER_ANTHROPIC_BASE_URL ||
+  envConfig.CONTAINER_ANTHROPIC_BASE_URL ||
+  undefined;
+export const CONTAINER_ANTHROPIC_API_KEY =
+  process.env.CONTAINER_ANTHROPIC_API_KEY ||
+  envConfig.CONTAINER_ANTHROPIC_API_KEY ||
+  undefined;
+export const CONTAINER_ANTHROPIC_MODEL =
+  process.env.CONTAINER_ANTHROPIC_MODEL ||
+  envConfig.CONTAINER_ANTHROPIC_MODEL ||
+  undefined;
+export const EDGE_RUNNER_MODE =
+  process.env.EDGE_RUNNER_MODE || envConfig.EDGE_RUNNER_MODE || 'node';
+export const EDGE_RUNNER_PROVIDER =
+  process.env.EDGE_RUNNER_PROVIDER || envConfig.EDGE_RUNNER_PROVIDER || 'local';
+export const EDGE_ENABLE_TOOLS =
+  (process.env.EDGE_ENABLE_TOOLS || envConfig.EDGE_ENABLE_TOOLS) === 'true';
+export const EDGE_DISABLE_FALLBACK =
+  (process.env.EDGE_DISABLE_FALLBACK || envConfig.EDGE_DISABLE_FALLBACK) ===
+  'true';
+export const EDGEJS_BIN =
+  process.env.EDGEJS_BIN || envConfig.EDGEJS_BIN || undefined;
+export const EDGE_API_BASE_URL =
+  process.env.EDGE_API_BASE_URL || envConfig.EDGE_API_BASE_URL || undefined;
+export const EDGE_API_KEY =
+  process.env.EDGE_API_KEY || envConfig.EDGE_API_KEY || undefined;
+export const EDGE_MODEL =
+  process.env.EDGE_MODEL || envConfig.EDGE_MODEL || undefined;
+export const EDGE_ANTHROPIC_API_BASE_URL =
+  process.env.EDGE_ANTHROPIC_API_BASE_URL ||
+  envConfig.EDGE_ANTHROPIC_API_BASE_URL ||
+  undefined;
+export const EDGE_ANTHROPIC_API_KEY =
+  process.env.EDGE_ANTHROPIC_API_KEY ||
+  envConfig.EDGE_ANTHROPIC_API_KEY ||
+  undefined;
+export const EDGE_ANTHROPIC_MODEL =
+  process.env.EDGE_ANTHROPIC_MODEL ||
+  envConfig.EDGE_ANTHROPIC_MODEL ||
+  'claude-sonnet-4-20250514';
 export const DEFAULT_EXECUTION_MODE = resolveExecutionMode(
   process.env.DEFAULT_EXECUTION_MODE || envConfig.DEFAULT_EXECUTION_MODE,
   'container',
 );
+export const SHADOW_EXECUTION_MODE = resolveShadowExecutionMode(
+  process.env.SHADOW_EXECUTION_MODE || envConfig.SHADOW_EXECUTION_MODE,
+);
+export const TERMINAL_CHANNEL_ENABLED =
+  (process.env.TERMINAL_CHANNEL || envConfig.TERMINAL_CHANNEL) === 'true';
+export const TERMINAL_GROUP_JID =
+  process.env.TERMINAL_GROUP_JID ||
+  envConfig.TERMINAL_GROUP_JID ||
+  'term:canary-group';
+export const TERMINAL_GROUP_NAME =
+  process.env.TERMINAL_GROUP_NAME ||
+  envConfig.TERMINAL_GROUP_NAME ||
+  'Terminal Canary';
+export const TERMINAL_RESET_SESSION_ON_START =
+  (process.env.TERMINAL_RESET_SESSION_ON_START ||
+    envConfig.TERMINAL_RESET_SESSION_ON_START) === 'true';
+export const TERMINAL_GROUP_FOLDER =
+  process.env.TERMINAL_GROUP_FOLDER ||
+  envConfig.TERMINAL_GROUP_FOLDER ||
+  'terminal_canary';
+export const TERMINAL_GROUP_EXECUTION_MODE = resolveExecutionMode(
+  process.env.TERMINAL_GROUP_EXECUTION_MODE ||
+    envConfig.TERMINAL_GROUP_EXECUTION_MODE,
+  'edge',
+);
+export const TERMINAL_USER_JID =
+  process.env.TERMINAL_USER_JID || envConfig.TERMINAL_USER_JID || 'term:user';
+export const TERMINAL_USER_NAME =
+  process.env.TERMINAL_USER_NAME || envConfig.TERMINAL_USER_NAME || 'You';
 export const CONTAINER_TIMEOUT = parseInt(
   process.env.CONTAINER_TIMEOUT || '1800000',
   10,

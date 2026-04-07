@@ -13,8 +13,10 @@ const MSG_COLOR = '\x1b[36m';
 const RESET = '\x1b[39m';
 const FULL_RESET = '\x1b[0m';
 
-const threshold =
-  LEVELS[(process.env.LOG_LEVEL as Level) || 'info'] ?? LEVELS.info;
+const defaultLevel =
+  (process.env.LOG_LEVEL as Level | undefined) ||
+  (process.env.TERMINAL_CHANNEL === 'true' ? 'error' : 'info');
+const threshold = LEVELS[defaultLevel] ?? LEVELS.info;
 
 function formatErr(err: unknown): string {
   if (err instanceof Error) {

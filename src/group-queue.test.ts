@@ -5,6 +5,7 @@ import { GroupQueue } from './group-queue.js';
 // Mock config to control concurrency limit
 vi.mock('./config.js', () => ({
   DATA_DIR: '/tmp/nanoclaw-test-data',
+  IDLE_TIMEOUT: 30 * 60 * 1000,
   MAX_CONCURRENT_CONTAINERS: 2,
 }));
 
@@ -98,9 +99,9 @@ describe('GroupQueue', () => {
     expect(processMessages).toHaveBeenCalledTimes(3);
   });
 
-  // --- Tasks prioritized over messages ---
+  // --- Foreground messages prioritized over tasks ---
 
-  it('drains tasks before messages for same group', async () => {
+  it('allows a background task to run while the foreground lane is busy for the same group', async () => {
     const executionOrder: string[] = [];
     let resolveFirst: () => void;
 
@@ -132,10 +133,46 @@ describe('GroupQueue', () => {
     resolveFirst!();
     await vi.advanceTimersByTimeAsync(10);
 
-    // Task should have run before the second message check
-    expect(executionOrder[0]).toBe('messages'); // first call
-    expect(executionOrder[1]).toBe('task'); // task runs first in drain
-    // Messages would run after task completes
+    expect(executionOrder[0]).toBe('task');
+    expect(executionOrder[1]).toBe('messages');
+    expect(executionOrder[2]).toBe('messages');
+  });
+
+  it('allows foreground messages to run while a background task is active for the same group', async () => {
+    let releaseTask!: () => void;
+    const executionOrder: string[] = [];
+
+    const processMessages = vi.fn(async (groupJid: string) => {
+      executionOrder.push(`messages:${groupJid}`);
+      return true;
+    });
+    queue.setProcessMessagesFn(processMessages);
+
+    const taskFn = vi.fn(async () => {
+      executionOrder.push('task:start');
+      await new Promise<void>((resolve) => {
+        releaseTask = resolve;
+      });
+      executionOrder.push('task:end');
+    });
+
+    queue.enqueueTask('group1@g.us', 'task-1', taskFn);
+    await vi.advanceTimersByTimeAsync(10);
+
+    queue.enqueueMessageCheck('group1@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(taskFn).toHaveBeenCalledTimes(1);
+    expect(processMessages).toHaveBeenCalledTimes(1);
+    expect(executionOrder).toEqual(['task:start', 'messages:group1@g.us']);
+
+    releaseTask();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(executionOrder).toEqual([
+      'task:start',
+      'messages:group1@g.us',
+      'task:end',
+    ]);
   });
 
   // --- Retry with backoff on failure ---
@@ -164,6 +201,19 @@ describe('GroupQueue', () => {
     await vi.advanceTimersByTimeAsync(10000);
     await vi.advanceTimersByTimeAsync(10);
     expect(callCount).toBe(3);
+  });
+
+  it('reports foreground work while a retry is scheduled', async () => {
+    const processMessages = vi.fn(async () => false);
+    queue.setProcessMessagesFn(processMessages);
+
+    queue.enqueueMessageCheck('group1@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(queue.hasForegroundWork('group1@g.us')).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(10);
   });
 
   // --- Shutdown prevents new enqueues ---
@@ -243,6 +293,40 @@ describe('GroupQueue', () => {
     expect(processed).toContain('group3@g.us');
   });
 
+  it('prefers waiting groups with foreground messages over task-only groups', async () => {
+    const processed: string[] = [];
+    const completionCallbacks: Array<() => void> = [];
+
+    const processMessages = vi.fn(async (groupJid: string) => {
+      processed.push(`messages:${groupJid}`);
+      await new Promise<void>((resolve) => completionCallbacks.push(resolve));
+      return true;
+    });
+
+    queue.setProcessMessagesFn(processMessages);
+
+    queue.enqueueMessageCheck('group1@g.us');
+    queue.enqueueMessageCheck('group2@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+
+    const taskFn = vi.fn(async () => {
+      processed.push('task:group3@g.us');
+    });
+    queue.enqueueTask('group3@g.us', 'task-1', taskFn);
+    queue.enqueueMessageCheck('group4@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+
+    completionCallbacks[0]();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(processed[2]).toBe('messages:group4@g.us');
+    expect(taskFn).not.toHaveBeenCalled();
+
+    completionCallbacks[1]();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(taskFn).toHaveBeenCalledTimes(1);
+  });
+
   // --- Running task dedup (Issue #138) ---
 
   it('rejects duplicate enqueue of a currently-running task', async () => {
@@ -320,7 +404,7 @@ describe('GroupQueue', () => {
     await vi.advanceTimersByTimeAsync(10);
   });
 
-  it('preempts idle container when task is enqueued', async () => {
+  it('does not preempt an idle foreground container when a background task is enqueued', async () => {
     const fs = await import('fs');
     let resolveProcess: () => void;
 
@@ -353,11 +437,11 @@ describe('GroupQueue', () => {
     const taskFn = vi.fn(async () => {});
     queue.enqueueTask('group1@g.us', 'task-1', taskFn);
 
-    // _close SHOULD have been written (container is idle)
+    // Background work now uses its own lane, so the foreground container stays open
     const closeWrites = writeFileSync.mock.calls.filter(
       (call) => typeof call[0] === 'string' && call[0].endsWith('_close'),
     );
-    expect(closeWrites).toHaveLength(1);
+    expect(closeWrites).toHaveLength(0);
 
     resolveProcess!();
     await vi.advanceTimersByTimeAsync(10);
@@ -433,7 +517,7 @@ describe('GroupQueue', () => {
     await vi.advanceTimersByTimeAsync(10);
   });
 
-  it('preempts when idle arrives with pending tasks', async () => {
+  it('does not preempt the foreground lane when it becomes idle with pending background tasks', async () => {
     const fs = await import('fs');
     let resolveProcess: () => void;
 
@@ -469,14 +553,14 @@ describe('GroupQueue', () => {
     );
     expect(closeWrites).toHaveLength(0);
 
-    // Now container becomes idle — should preempt because task is pending
+    // Now the foreground lane becomes idle — background work should still stay isolated
     writeFileSync.mockClear();
     queue.notifyIdle('group1@g.us');
 
     closeWrites = writeFileSync.mock.calls.filter(
       (call) => typeof call[0] === 'string' && call[0].endsWith('_close'),
     );
-    expect(closeWrites).toHaveLength(1);
+    expect(closeWrites).toHaveLength(0);
 
     resolveProcess!();
     await vi.advanceTimersByTimeAsync(10);
