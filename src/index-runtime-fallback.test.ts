@@ -431,4 +431,101 @@ describe('index group runtime fallback', () => {
     expect(sendMessage).toHaveBeenCalledWith('room@g.us', 'edge result');
     expect(syncObservabilitySnapshotToIpc).toHaveBeenCalledWith('team_alpha');
   });
+
+  it('cleans up terminal runtime on startup reset without affecting other groups', async () => {
+    vi.resetModules();
+
+    const db = await import('./db.js');
+    const index = await import('./index.js');
+    const { createRootTaskGraph, markTaskNodeRunning } = await import(
+      './task-graph-state.js'
+    );
+    const { beginExecution } = await import('./execution-state.js');
+
+    db._initTestDatabase();
+    index._setRegisteredGroups({});
+    index._setChannelsForTests([]);
+    index._setSessionsForTests({
+      terminal_canary: 'session-terminal-old',
+      team_alpha: 'session-team-old',
+    });
+    index._setLastAgentTimestampForTests({});
+
+    db.setSession('terminal_canary', 'session-terminal-old');
+    db.setSession('team_alpha', 'session-team-old');
+
+    createRootTaskGraph({
+      graphId: 'graph:terminal-stale',
+      rootTaskId: 'task:terminal-stale:root',
+      requestKind: 'group_turn',
+      scopeType: 'group',
+      scopeId: 'terminal_canary',
+      groupFolder: 'terminal_canary',
+      chatJid: 'term:canary-group',
+      logicalSessionId: 'group:terminal_canary',
+      workerClass: 'edge',
+      backendId: 'edge',
+      now: new Date('2026-04-08T00:00:00.000Z'),
+    });
+    markTaskNodeRunning('graph:terminal-stale', 'task:terminal-stale:root');
+
+    createRootTaskGraph({
+      graphId: 'graph:other-running',
+      rootTaskId: 'task:other-running:root',
+      requestKind: 'group_turn',
+      scopeType: 'group',
+      scopeId: 'team_alpha',
+      groupFolder: 'team_alpha',
+      chatJid: 'room@g.us',
+      logicalSessionId: 'group:team_alpha',
+      workerClass: 'edge',
+      backendId: 'edge',
+      now: new Date('2026-04-08T00:00:01.000Z'),
+    });
+    markTaskNodeRunning('graph:other-running', 'task:other-running:root');
+
+    const terminalExecution = beginExecution({
+      scopeType: 'group',
+      scopeId: 'terminal_canary',
+      backend: 'edge',
+      groupJid: 'term:canary-group',
+      taskNodeId: 'task:terminal-stale:root',
+      now: new Date('2026-04-08T00:00:00.000Z'),
+      leaseMs: 300_000,
+    });
+    const otherExecution = beginExecution({
+      scopeType: 'group',
+      scopeId: 'team_alpha',
+      backend: 'edge',
+      groupJid: 'room@g.us',
+      taskNodeId: 'task:other-running:root',
+      now: new Date('2026-04-08T00:00:01.000Z'),
+      leaseMs: 300_000,
+    });
+
+    index._cleanupTerminalRuntimeForTests('startup');
+
+    expect(db.getSession('terminal_canary')).toBeUndefined();
+    expect(db.getSession('team_alpha')).toBe('session-team-old');
+
+    expect(db.getExecutionState(terminalExecution.executionId)).toMatchObject({
+      status: 'failed',
+      error: 'Terminal session reset on startup',
+    });
+    expect(db.getTaskGraph('graph:terminal-stale')).toMatchObject({
+      status: 'failed',
+      error: 'Terminal session reset on startup',
+    });
+    expect(db.getTaskNode('task:terminal-stale:root')).toMatchObject({
+      status: 'failed',
+      error: 'Terminal session reset on startup',
+    });
+
+    expect(db.getExecutionState(otherExecution.executionId)).toMatchObject({
+      status: 'running',
+    });
+    expect(db.getTaskGraph('graph:other-running')).toMatchObject({
+      status: 'running',
+    });
+  });
 });

@@ -9,9 +9,9 @@ import { isValidTimezone } from './timezone.js';
 const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
-  'CONTAINER_ANTHROPIC_BASE_URL',
-  'CONTAINER_ANTHROPIC_API_KEY',
-  'CONTAINER_ANTHROPIC_MODEL',
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_MODEL',
   'DEFAULT_EXECUTION_MODE',
   'EDGEJS_BIN',
   'EDGE_API_BASE_URL',
@@ -77,17 +77,17 @@ export const DATA_DIR = path.resolve(
 
 export const CONTAINER_IMAGE =
   process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
-export const CONTAINER_ANTHROPIC_BASE_URL =
-  process.env.CONTAINER_ANTHROPIC_BASE_URL ||
-  envConfig.CONTAINER_ANTHROPIC_BASE_URL ||
+export const ANTHROPIC_BASE_URL =
+  process.env.ANTHROPIC_BASE_URL ||
+  envConfig.ANTHROPIC_BASE_URL ||
   undefined;
-export const CONTAINER_ANTHROPIC_API_KEY =
-  process.env.CONTAINER_ANTHROPIC_API_KEY ||
-  envConfig.CONTAINER_ANTHROPIC_API_KEY ||
+export const ANTHROPIC_API_KEY =
+  process.env.ANTHROPIC_API_KEY ||
+  envConfig.ANTHROPIC_API_KEY ||
   undefined;
-export const CONTAINER_ANTHROPIC_MODEL =
-  process.env.CONTAINER_ANTHROPIC_MODEL ||
-  envConfig.CONTAINER_ANTHROPIC_MODEL ||
+export const ANTHROPIC_MODEL =
+  process.env.ANTHROPIC_MODEL ||
+  envConfig.ANTHROPIC_MODEL ||
   undefined;
 export const EDGE_RUNNER_MODE =
   process.env.EDGE_RUNNER_MODE || envConfig.EDGE_RUNNER_MODE || 'node';

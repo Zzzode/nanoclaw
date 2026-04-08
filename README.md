@@ -173,7 +173,7 @@ Yes. NanoClaw supports any Claude API-compatible model endpoint. Set these envir
 
 ```bash
 ANTHROPIC_BASE_URL=https://your-api-endpoint.com
-ANTHROPIC_AUTH_TOKEN=your-token-here
+ANTHROPIC_API_KEY=your-token-here
 ```
 
 This allows you to use:

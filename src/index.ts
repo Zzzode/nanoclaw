@@ -51,18 +51,23 @@ import {
   getNewMessages,
   getRouterState,
   initDatabase,
+  listExecutionStates,
+  listTaskGraphs,
+  listTaskNodes,
   setRegisteredGroup,
   setRouterState,
   setSession,
   storeChatMetadata,
   storeMessage,
   storeMessageDirect,
+  updateTaskNode,
 } from './db.js';
 import {
   commitExecution,
   completeExecution,
   failExecution,
   heartbeatExecution,
+  requestExecutionCancel,
 } from './execution-state.js';
 import {
   buildGroupsSnapshotPayload,
@@ -96,6 +101,17 @@ import {
 import { emitTerminalSystemEvent } from './channels/terminal.js';
 import { createFrameworkRunContext } from './framework-orchestrator.js';
 import {
+  beginTerminalTurn,
+  completeTerminalTurn,
+  failTerminalTurn,
+  getTerminalWorkerLabel,
+  recordTerminalFallback,
+  recordTerminalTimeline,
+  resetTerminalObservability,
+  ensureTerminalWorker,
+  updateTerminalTurnStage,
+} from './terminal-observability.js';
+import {
   createFrameworkWorkerRegistry,
   type FrameworkWorkerRegistry,
 } from './framework-worker.js';
@@ -116,6 +132,56 @@ let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+
+function summarizeRuntimeError(error: string | null | undefined): string {
+  const normalized = typeof error === 'string' ? error.trim() : '';
+  if (!normalized) return 'Unknown error';
+  const singleLine = normalized.replace(/\s+/g, ' ');
+  return singleLine.length <= 200
+    ? singleLine
+    : `${singleLine.slice(0, 200)}...`;
+}
+
+function handleStructuredAgentOutput(options: {
+  chatJid: string;
+  graphId: string;
+  executionId: string | null;
+  backendId: string;
+  workerClass: 'edge' | 'heavy';
+  output: AgentRunOutput;
+}): boolean {
+  const metadata = options.output.metadata;
+  if (!metadata?.event) return false;
+
+  const targetKey = metadata.targetKey ?? 'root';
+  const detail = metadata.detail ?? metadata.summary ?? metadata.event;
+
+  ensureTerminalWorker({
+    chatJid: options.chatJid,
+    key: targetKey,
+    backendId: options.backendId,
+    workerClass: options.workerClass,
+    executionId: options.executionId,
+    status: 'running',
+    activity: detail,
+    summary: metadata.summary,
+  });
+  recordTerminalTimeline({
+    chatJid: options.chatJid,
+    targetKey,
+    text: `${getTerminalWorkerLabel(targetKey)} · ${metadata.event}${detail ? ` · ${detail}` : ''}`,
+  });
+  updateTerminalTurnStage({
+    chatJid: options.chatJid,
+    graphId: options.graphId,
+    executionId: options.executionId,
+    stage: metadata.event,
+    backendId: options.backendId,
+    workerClass: options.workerClass,
+    activity: detail,
+  });
+  return true;
+}
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -237,6 +303,51 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   );
 }
 
+const TERMINAL_SOURCE_MOUNT_TARGETS = [
+  'package.json',
+  'tsconfig.json',
+  'src',
+] as const;
+
+function mountProjectSourceIntoGroup(groupFolder: string): void {
+  const groupDir = resolveGroupFolderPath(groupFolder);
+  const projectRoot = process.cwd();
+
+  for (const target of TERMINAL_SOURCE_MOUNT_TARGETS) {
+    const sourcePath = path.join(projectRoot, target);
+    const destPath = path.join(groupDir, target);
+
+    if (!fs.existsSync(sourcePath)) continue;
+    if (fs.existsSync(destPath)) {
+      try {
+        const stat = fs.lstatSync(destPath);
+        if (stat.isSymbolicLink()) {
+          const currentTarget = fs.readlinkSync(destPath);
+          if (currentTarget === sourcePath) continue;
+          fs.unlinkSync(destPath);
+        } else {
+          continue;
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    try {
+      fs.symlinkSync(sourcePath, destPath);
+      logger.info(
+        { groupFolder, target, sourcePath },
+        'Mounted project source into group workspace',
+      );
+    } catch (err) {
+      logger.warn(
+        { groupFolder, target, err },
+        'Failed to mount project source into group workspace',
+      );
+    }
+  }
+}
+
 function ensureTerminalCanaryGroup(): void {
   if (!TERMINAL_CHANNEL_ENABLED) return;
   const existing = registeredGroups[TERMINAL_GROUP_JID];
@@ -257,15 +368,141 @@ function ensureTerminalCanaryGroup(): void {
     executionMode: TERMINAL_GROUP_EXECUTION_MODE,
     requiresTrigger: false,
   });
+
+  mountProjectSourceIntoGroup(TERMINAL_GROUP_FOLDER);
 }
 
 function resetTerminalSession(reason: 'startup' | 'command'): void {
   delete sessions[TERMINAL_GROUP_FOLDER];
   deleteSession(TERMINAL_GROUP_FOLDER);
+  resetTerminalObservability();
   logger.info(
     { group: TERMINAL_GROUP_FOLDER, reason },
     'Terminal session reset',
   );
+}
+
+function failTerminalTaskNodes(graphId: string, error: string): number {
+  const timestamp = new Date().toISOString();
+  let failedCount = 0;
+
+  for (const node of listTaskNodes(graphId)) {
+    if (node.status === 'completed' || node.status === 'failed') {
+      continue;
+    }
+    updateTaskNode(node.taskId, {
+      status: 'failed',
+      error,
+      updatedAt: timestamp,
+    });
+    failedCount += 1;
+  }
+
+  return failedCount;
+}
+
+function cleanupTerminalRuntime(options: {
+  reason: 'startup' | 'command' | 'quit' | 'interrupt';
+  error: string;
+  resetSession: boolean;
+  finalizeExecutions: boolean;
+  closeForeground: boolean;
+  closeBackground: boolean;
+  clearPendingMessages: boolean;
+  clearPendingTasks: boolean;
+}): void {
+  const activeExecutions = listExecutionStates().filter(
+    (execution) =>
+      execution.groupJid === TERMINAL_GROUP_JID &&
+      (execution.status === 'running' ||
+        execution.status === 'cancel_requested'),
+  );
+
+  for (const execution of activeExecutions) {
+    requestExecutionCancel(execution.executionId);
+    if (options.finalizeExecutions) {
+      failExecution(execution.executionId, options.error);
+    }
+  }
+
+  const runningGraphs = listTaskGraphs().filter(
+    (graph) =>
+      (graph.chatJid === TERMINAL_GROUP_JID ||
+        graph.groupFolder === TERMINAL_GROUP_FOLDER) &&
+      graph.status === 'running',
+  );
+  let failedNodes = 0;
+  for (const graph of runningGraphs) {
+    failedNodes += failTerminalTaskNodes(graph.graphId, options.error);
+    failRootTaskGraph(graph.graphId, graph.rootTaskId, options.error);
+  }
+
+  queue.resetGroup(TERMINAL_GROUP_JID, {
+    closeForeground: options.closeForeground,
+    closeBackground: options.closeBackground,
+    clearPendingMessages: options.clearPendingMessages,
+    clearPendingTasks: options.clearPendingTasks,
+  });
+
+  if (options.resetSession) {
+    resetTerminalSession(options.reason === 'startup' ? 'startup' : 'command');
+  }
+
+  logger.info(
+    {
+      reason: options.reason,
+      resetSession: options.resetSession,
+      finalizeExecutions: options.finalizeExecutions,
+      affectedExecutions: activeExecutions.length,
+      affectedGraphs: runningGraphs.length,
+      affectedNodes: failedNodes,
+    },
+    'Terminal runtime cleaned up',
+  );
+}
+
+function gracefulTerminalQuit(): void {
+  cleanupTerminalRuntime({
+    reason: 'quit',
+    error: 'Terminal session quit',
+    resetSession: true,
+    finalizeExecutions: false,
+    closeForeground: true,
+    closeBackground: true,
+    clearPendingMessages: true,
+    clearPendingTasks: true,
+  });
+}
+
+/**
+ * Interrupt the current terminal turn by cancelling active executions and task graphs.
+ * Unlike gracefulTerminalQuit, this does NOT reset the session — it only stops
+ * the current run so the user can start a new turn immediately.
+ */
+function interruptTerminalTurn(): void {
+  cleanupTerminalRuntime({
+    reason: 'interrupt',
+    error: 'Terminal turn interrupted',
+    resetSession: false,
+    finalizeExecutions: false,
+    closeForeground: true,
+    closeBackground: false,
+    clearPendingMessages: true,
+    clearPendingTasks: false,
+  });
+}
+
+function resetTerminalConversation(): void {
+  cleanupTerminalRuntime({
+    reason: 'command',
+    error: 'Terminal session reset',
+    resetSession: true,
+    finalizeExecutions: false,
+    closeForeground: true,
+    closeBackground: true,
+    clearPendingMessages: true,
+    clearPendingTasks: true,
+  });
 }
 
 function recordBotMessage(chatJid: string, text: string): void {
@@ -324,6 +561,27 @@ export function _setLastAgentTimestampForTests(
   next: Record<string, string>,
 ): void {
   lastAgentTimestamp = next;
+}
+
+/** @internal - exported for testing */
+export function _cleanupTerminalRuntimeForTests(
+  reason: 'startup' | 'command' | 'quit' = 'startup',
+): void {
+  cleanupTerminalRuntime({
+    reason,
+    error:
+      reason === 'startup'
+        ? 'Terminal session reset on startup'
+        : reason === 'quit'
+          ? 'Terminal session quit'
+          : 'Terminal session reset',
+    resetSession: true,
+    finalizeExecutions: reason === 'startup',
+    closeForeground: true,
+    closeBackground: true,
+    clearPendingMessages: true,
+    clearPendingTasks: true,
+  });
 }
 
 /** @internal - exported for testing */
@@ -401,6 +659,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
+  let typingReleased = false;
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
@@ -416,6 +675,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         await channel.sendMessage(chatJid, text);
         recordBotMessage(chatJid, text);
         outputSentToUser = true;
+        if (!typingReleased) {
+          await channel.setTyping?.(chatJid, false);
+          typingReleased = true;
+        }
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
@@ -430,7 +693,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   });
 
-  await channel.setTyping?.(chatJid, false);
+  if (!typingReleased) {
+    await channel.setTyping?.(chatJid, false);
+  }
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
@@ -528,6 +793,16 @@ async function runAgent(
     chatJid,
     `执行开始：${graph.graphId} · ${placement.backendId}/${placement.workerClass}`,
   );
+  beginTerminalTurn({
+    chatJid,
+    graphId: graph.graphId,
+    rootTaskId: graph.rootTaskId,
+    executionId: execution.executionId,
+    stage: 'starting',
+    backendId: placement.backendId,
+    workerClass: placement.workerClass,
+    activity: `执行开始：${graph.graphId} · ${placement.backendId}/${placement.workerClass}`,
+  });
 
   try {
     executionId = execution.executionId;
@@ -545,9 +820,40 @@ async function runAgent(
       if (executionId) heartbeatExecution(executionId);
       if (output.status === 'error') {
         streamedError = output.error || 'Unknown error';
+        updateTerminalTurnStage({
+          chatJid,
+          graphId: graph.graphId,
+          executionId: effectiveExecutionId,
+          stage: 'stream_error',
+          backendId: effectiveBackendId,
+          workerClass: effectiveBackendId === 'container' ? 'heavy' : 'edge',
+          activity: output.error || 'Unknown error',
+          error: output.error || 'Unknown error',
+        });
       }
+      const handledStructuredOutput = handleStructuredAgentOutput({
+        chatJid,
+        graphId: graph.graphId,
+        executionId: effectiveExecutionId,
+        backendId: effectiveBackendId,
+        workerClass: effectiveBackendId === 'container' ? 'heavy' : 'edge',
+        output,
+      });
       if (output.result) {
         streamedVisibleResult = true;
+        updateTerminalTurnStage({
+          chatJid,
+          graphId: graph.graphId,
+          executionId: effectiveExecutionId,
+          stage: 'streaming_output',
+          backendId: effectiveBackendId,
+          workerClass: effectiveBackendId === 'container' ? 'heavy' : 'edge',
+          activity: output.result,
+        });
+      }
+      if (handledStructuredOutput && !output.result && !output.error) {
+        await onOutput?.(output);
+        return;
       }
       await onOutput?.(output);
     };
@@ -579,12 +885,12 @@ async function runAgent(
       },
       usesHeavyWorker
         ? (execution) =>
-            queue.registerProcess(
-              execution.chatJid,
-              execution.process,
-              execution.executionName,
-              execution.groupFolder,
-            )
+          queue.registerProcess(
+            execution.chatJid,
+            execution.process,
+            execution.executionName,
+            execution.groupFolder,
+          )
         : undefined,
       wrappedOnOutput,
     );
@@ -597,14 +903,22 @@ async function runAgent(
     });
 
     if (recovery.kind === 'fallback' && executionId) {
+      const rawError = streamedError || output.error || 'Unknown error';
       failExecution(
         executionId,
-        streamedError || output.error || 'Unknown error',
+        rawError,
       );
       emitTerminalSystemEvent(
         chatJid,
-        `执行降级：${graph.graphId} · edge → heavy · ${recovery.reason}`,
+        `执行降级：${graph.graphId} · edge → heavy · ${recovery.reason} · ${summarizeRuntimeError(rawError)}`,
       );
+      recordTerminalFallback({
+        chatJid,
+        fromBackend: 'edge',
+        toBackend: 'container',
+        reason: recovery.reason,
+        detail: rawError,
+      });
 
       if (sessionId) {
         sessions[group.folder] = sessionId;
@@ -631,6 +945,15 @@ async function runAgent(
       effectiveBackendId = 'container';
       streamedError = null;
       streamedVisibleResult = false;
+      updateTerminalTurnStage({
+        chatJid,
+        graphId: graph.graphId,
+        executionId: effectiveExecutionId,
+        stage: 'fallback_running',
+        backendId: 'container',
+        workerClass: 'heavy',
+        activity: `heavy fallback started · ${recovery.reason}`,
+      });
 
       output = await frameworkWorkers.container.run(
         group,
@@ -725,6 +1048,12 @@ async function runAgent(
         graph.rootTaskId,
         error || 'Unknown error',
       );
+      failTerminalTurn({
+        chatJid,
+        stage: 'failed',
+        error: error || 'Unknown error',
+        activity: `执行失败：${graph.graphId} · ${error || 'Unknown error'}`,
+      });
       emitTerminalSystemEvent(
         chatJid,
         `执行失败：${graph.graphId} · ${error || 'Unknown error'}`,
@@ -739,6 +1068,11 @@ async function runAgent(
     commitExecution(effectiveExecutionId);
     completeExecution(effectiveExecutionId);
     completeRootTaskGraph(graph.graphId, graph.rootTaskId);
+    completeTerminalTurn({
+      chatJid,
+      stage: 'completed',
+      activity: `执行完成：${graph.graphId}`,
+    });
     emitTerminalSystemEvent(chatJid, `执行完成：${graph.graphId}`);
     return 'success';
   } catch (err) {
@@ -754,6 +1088,12 @@ async function runAgent(
       markTaskNodeForReplan(graph.rootTaskId, recovery.reason);
     }
     failRootTaskGraph(graph.graphId, graph.rootTaskId, error);
+    failTerminalTurn({
+      chatJid,
+      stage: 'failed',
+      error,
+      activity: `执行失败：${graph.graphId} · ${error}`,
+    });
     emitTerminalSystemEvent(chatJid, `执行失败：${graph.graphId} · ${error}`);
     logger.error({ group: group.name, err }, 'Agent error');
     return 'error';
@@ -919,7 +1259,16 @@ async function main(): Promise<void> {
   loadState();
   ensureTerminalCanaryGroup();
   if (TERMINAL_CHANNEL_ENABLED && TERMINAL_RESET_SESSION_ON_START) {
-    resetTerminalSession('startup');
+    cleanupTerminalRuntime({
+      reason: 'startup',
+      error: 'Terminal session reset on startup',
+      resetSession: true,
+      finalizeExecutions: true,
+      closeForeground: true,
+      closeBackground: true,
+      clearPendingMessages: true,
+      clearPendingTasks: true,
+    });
   }
 
   if (
@@ -1036,7 +1385,18 @@ async function main(): Promise<void> {
     registeredGroups: () => registeredGroups,
     onResetSession: (groupFolder: string) => {
       if (groupFolder === TERMINAL_GROUP_FOLDER) {
-        resetTerminalSession('command');
+        resetTerminalConversation();
+      }
+    },
+    onQuit: (groupFolder: string) => {
+      if (groupFolder === TERMINAL_GROUP_FOLDER) {
+        gracefulTerminalQuit();
+      }
+    },
+    onCancel: (groupFolder: string) => {
+      if (groupFolder === TERMINAL_GROUP_FOLDER) {
+        interruptTerminalTurn();
+        emitTerminalSystemEvent(TERMINAL_GROUP_JID, '已打断当前对话（ESC）');
       }
     },
   };
@@ -1131,7 +1491,7 @@ async function main(): Promise<void> {
 const isDirectRun =
   process.argv[1] &&
   new URL(import.meta.url).pathname ===
-    new URL(`file://${process.argv[1]}`).pathname;
+  new URL(`file://${process.argv[1]}`).pathname;
 
 if (isDirectRun) {
   main().catch((err) => {

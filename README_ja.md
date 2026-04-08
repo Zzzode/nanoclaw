@@ -193,7 +193,7 @@ Dockerはクロスプラットフォーム対応（macOS、Linux、さらにWSL2
 
 ```bash
 ANTHROPIC_BASE_URL=https://your-api-endpoint.com
-ANTHROPIC_AUTH_TOKEN=your-token-here
+ANTHROPIC_API_KEY=your-token-here
 ```
 
 以下が使用可能です：

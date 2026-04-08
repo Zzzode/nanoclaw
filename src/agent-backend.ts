@@ -13,7 +13,7 @@ export interface ExecutionDeadline {
 }
 
 export interface ExecutionPlanFragment {
-  kind: 'single_root' | 'edge_fanout_child' | 'edge_fanout_aggregate';
+  kind: 'single_root' | 'edge_fanout_child' | 'edge_fanout_aggregate' | 'edge_team_planner';
   requestKind?: string;
   routeReason?: string;
   policyVersion?: string;
@@ -63,6 +63,13 @@ export interface AgentRunOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  metadata?: {
+    source?: 'edge' | 'heavy';
+    event?: string;
+    targetKey?: string;
+    detail?: string;
+    summary?: string;
+  };
 }
 
 export interface StartedExecution {

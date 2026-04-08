@@ -101,6 +101,17 @@ vi.mock('../framework-observability.js', () => ({
   })),
 }));
 
+vi.mock('../terminal-observability.js', () => ({
+  buildTerminalActiveTurnSummary: vi.fn(() => 'activeTurn: none'),
+  buildTerminalAgentsSummaryFromObservability: vi.fn(() => null),
+  buildTerminalFocusSummary: vi.fn(() => null),
+  buildTerminalGraphSummaryFromObservability: vi.fn(() => null),
+  cycleTerminalFocus: vi.fn(() => null),
+  getTerminalTurnState: vi.fn(() => null),
+  resetTerminalObservability: vi.fn(),
+  setTerminalFocus: vi.fn((target: string) => `focus -> ${target}`),
+}));
+
 import {
   getAllTasks,
   getTaskById,
@@ -125,11 +136,25 @@ import {
   resetTerminalEventLogForTests,
 } from './terminal.js';
 import { getChannelFactory } from './registry.js';
+import {
+  buildTerminalAgentsSummaryFromObservability,
+  buildTerminalGraphSummaryFromObservability,
+  buildTerminalFocusSummary,
+  cycleTerminalFocus,
+  resetTerminalObservability,
+  setTerminalFocus,
+} from '../terminal-observability.js';
 
 describe('terminal ui helpers', () => {
   beforeEach(() => {
     readlineHarness.reset();
     resetTerminalEventLogForTests();
+    vi.mocked(buildTerminalAgentsSummaryFromObservability).mockReturnValue(null);
+    vi.mocked(buildTerminalGraphSummaryFromObservability).mockReturnValue(null);
+    vi.mocked(buildTerminalFocusSummary).mockReturnValue(null);
+    vi.mocked(cycleTerminalFocus).mockReturnValue(null);
+    vi.mocked(resetTerminalObservability).mockReset();
+    vi.mocked(setTerminalFocus).mockImplementation((target: string) => `focus -> ${target}`);
     vi.mocked(getAllTasks).mockReturnValue([
       {
         id: 'task-active',
@@ -625,7 +650,117 @@ describe('terminal ui helpers', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(onResetSession).toHaveBeenCalledWith('terminal_canary');
+    expect(resetTerminalObservability).toHaveBeenCalledTimes(1);
     await channel!.disconnect();
+  });
+
+  it('handles `/focus` command via observability store', async () => {
+    const factory = getChannelFactory('terminal');
+    const channel = factory!({
+      onMessage: vi.fn(),
+      onChatMetadata: vi.fn(),
+      registeredGroups: () => ({}),
+    });
+
+    expect(channel).not.toBeNull();
+    await channel!.connect();
+
+    readlineHarness.emitLine('/focus worker 2');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(setTerminalFocus).toHaveBeenCalledWith('worker 2');
+    await channel!.disconnect();
+  });
+
+  it('cycles focus on Shift+Down escape sequence', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    vi.mocked(cycleTerminalFocus).mockReturnValue('worker 2');
+    vi.mocked(buildTerminalFocusSummary).mockReturnValue('focus: worker 2');
+    const writeSpy = vi
+      .spyOn(process.stdout, 'write')
+      .mockImplementation(() => true);
+
+    try {
+      const factory = getChannelFactory('terminal');
+      const channel = factory!({
+        onMessage: vi.fn(),
+        onChatMetadata: vi.fn(),
+        registeredGroups: () => ({}),
+      });
+
+      expect(channel).not.toBeNull();
+      await channel!.connect();
+
+      process.stdin.emit('data', Buffer.from('\u001b[1;2B'));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(cycleTerminalFocus).toHaveBeenCalledWith(1);
+      expect(
+        writeSpy.mock.calls.some(([chunk]) => String(chunk).includes('focus: worker 2')),
+      ).toBe(true);
+
+      await channel!.disconnect();
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
+
+  it('calls onQuit callback before exiting on `/quit`', async () => {
+    const exitSpy = vi
+      .spyOn(process, 'exit')
+      .mockImplementation(() => undefined as never);
+
+    try {
+      const onQuit = vi.fn();
+      const factory = getChannelFactory('terminal');
+      expect(factory).toBeTypeOf('function');
+      const channel = factory!({
+        onMessage: vi.fn(),
+        onChatMetadata: vi.fn(),
+        onQuit,
+        registeredGroups: () => ({}),
+      });
+
+      expect(channel).not.toBeNull();
+      await channel!.connect();
+
+      readlineHarness.emitLine('/quit');
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(onQuit).toHaveBeenCalledWith('terminal_canary');
+      expect(exitSpy).toHaveBeenCalledWith(0);
+    } finally {
+      exitSpy.mockRestore();
+    }
+  });
+
+  it('calls onQuit callback before exiting on `/exit`', async () => {
+    const exitSpy = vi
+      .spyOn(process, 'exit')
+      .mockImplementation(() => undefined as never);
+
+    try {
+      const onQuit = vi.fn();
+      const factory = getChannelFactory('terminal');
+      expect(factory).toBeTypeOf('function');
+      const channel = factory!({
+        onMessage: vi.fn(),
+        onChatMetadata: vi.fn(),
+        onQuit,
+        registeredGroups: () => ({}),
+      });
+
+      expect(channel).not.toBeNull();
+      await channel!.connect();
+
+      readlineHarness.emitLine('/exit');
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(onQuit).toHaveBeenCalledWith('terminal_canary');
+      expect(exitSpy).toHaveBeenCalledWith(0);
+    } finally {
+      exitSpy.mockRestore();
+    }
   });
 
   it('re-renders the prompt after local `/agents` commands', async () => {
@@ -690,33 +825,265 @@ describe('terminal ui helpers', () => {
     }
   });
 
-  it('does not redraw the prompt for system events while typing is active', async () => {
+  it('refreshes the panel for system events while typing is active', async () => {
+    const writeSpy = vi
+      .spyOn(process.stdout, 'write')
+      .mockImplementation(() => true);
+
+    try {
+      const factory = getChannelFactory('terminal');
+      const channel = factory!({
+        onMessage: vi.fn(),
+        onChatMetadata: vi.fn(),
+        registeredGroups: () => ({}),
+      });
+
+      expect(channel).not.toBeNull();
+      await channel!.connect();
+      const promptCountAfterConnect = readlineHarness.rl.prompt.mock.calls.length;
+
+      await channel!.setTyping?.('term:canary-group', true);
+      const promptCountWhileBusy = readlineHarness.rl.prompt.mock.calls.length;
+
+      emitTerminalSystemEvent(
+        'term:canary-group',
+        '执行开始：graph:test · edge/edge',
+      );
+
+      expect(readlineHarness.rl.prompt.mock.calls.length).toBe(
+        promptCountWhileBusy + 1,
+      );
+      expect(
+        writeSpy.mock.calls.some(([chunk]) =>
+          String(chunk).includes('执行开始：graph:test · edge/edge'),
+        ),
+      ).toBe(true);
+
+      await channel!.setTyping?.('term:canary-group', false);
+      expect(readlineHarness.rl.prompt.mock.calls.length).toBe(
+        promptCountAfterConnect + 3,
+      );
+      await channel!.disconnect();
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
+
+  it('refreshes the panel for system events while executions are still active', async () => {
+    const writeSpy = vi
+      .spyOn(process.stdout, 'write')
+      .mockImplementation(() => true);
+
+    try {
+      const factory = getChannelFactory('terminal');
+      const channel = factory!({
+        onMessage: vi.fn(),
+        onChatMetadata: vi.fn(),
+        registeredGroups: () => ({}),
+      });
+
+      expect(channel).not.toBeNull();
+      await channel!.connect();
+      const promptCountAfterConnect = readlineHarness.rl.prompt.mock.calls.length;
+
+      emitTerminalSystemEvent(
+        'term:canary-group',
+        'team planner accepted fanout · 3 workers',
+      );
+
+      expect(readlineHarness.rl.prompt.mock.calls.length).toBe(
+        promptCountAfterConnect + 1,
+      );
+      expect(
+        writeSpy.mock.calls.some(([chunk]) =>
+          String(chunk).includes('team planner accepted fanout · 3 workers'),
+        ),
+      ).toBe(true);
+
+      await channel!.disconnect();
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
+
+  it('renders a conversation transcript for user, system, and assistant updates', async () => {
+    const writeSpy = vi
+      .spyOn(process.stdout, 'write')
+      .mockImplementation(() => true);
+
+    try {
+      const factory = getChannelFactory('terminal');
+      const channel = factory!({
+        onMessage: vi.fn(),
+        onChatMetadata: vi.fn(),
+        registeredGroups: () => ({}),
+      });
+
+      expect(channel).not.toBeNull();
+      await channel!.connect();
+
+      readlineHarness.emitLine('你好');
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      emitTerminalSystemEvent(
+        'term:canary-group',
+        'team planner accepted fanout · 3 workers',
+      );
+      await channel!.sendMessage?.('term:canary-group', '已开始处理');
+
+      const finalFrame = String(writeSpy.mock.calls.at(-1)?.[0] ?? '');
+      expect(finalFrame).toContain('[ Transcript ]');
+      expect(finalFrame).toContain('你好');
+      expect(finalFrame).toContain('team planner accepted fanout · 3 workers');
+      expect(finalFrame).toContain('已开始处理');
+
+      await channel!.disconnect();
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
+
+  it('clears conversation transcript via `/new`', async () => {
+    const writeSpy = vi
+      .spyOn(process.stdout, 'write')
+      .mockImplementation(() => true);
+
+    try {
+      const factory = getChannelFactory('terminal');
+      const channel = factory!({
+        onMessage: vi.fn(),
+        onChatMetadata: vi.fn(),
+        onResetSession: vi.fn(),
+        registeredGroups: () => ({}),
+      });
+
+      expect(channel).not.toBeNull();
+      await channel!.connect();
+      await channel!.sendMessage?.('term:canary-group', '旧回复');
+
+      readlineHarness.emitLine('/new');
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const finalFrame = String(writeSpy.mock.calls.at(-1)?.[0] ?? '');
+      expect(finalFrame).not.toContain('旧回复');
+      expect(finalFrame).toContain('已清空当前 terminal provider session');
+
+      await channel!.disconnect();
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
+
+  it('triggers onCancel when ESC is pressed during active typing', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    const onCancel = vi.fn();
     const factory = getChannelFactory('terminal');
     const channel = factory!({
       onMessage: vi.fn(),
       onChatMetadata: vi.fn(),
+      onCancel,
       registeredGroups: () => ({}),
     });
 
     expect(channel).not.toBeNull();
     await channel!.connect();
-    const promptCountAfterConnect = readlineHarness.rl.prompt.mock.calls.length;
 
     await channel!.setTyping?.('term:canary-group', true);
-    const promptCountWhileBusy = readlineHarness.rl.prompt.mock.calls.length;
 
-    emitTerminalSystemEvent(
-      'term:canary-group',
-      '执行开始：graph:test · edge/edge',
-    );
-    expect(readlineHarness.rl.prompt.mock.calls.length).toBe(
-      promptCountWhileBusy,
-    );
+    process.stdin.emit('data', Buffer.from([0x1b]));
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
-    await channel!.setTyping?.('term:canary-group', false);
-    expect(readlineHarness.rl.prompt.mock.calls.length).toBe(
-      promptCountAfterConnect + 2,
-    );
+    expect(onCancel).toHaveBeenCalledWith('terminal_canary');
+    await channel!.disconnect();
+  });
+
+  it('triggers onCancel when ESC is pressed with running executions', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    vi.mocked(listExecutionStates).mockReturnValue([
+      {
+        executionId: 'exec-running',
+        logicalSessionId: 'session-1',
+        turnId: 'turn-1',
+        taskNodeId: 'task:root',
+        groupJid: 'term:canary-group',
+        taskId: 'task-1',
+        backend: 'edge',
+        edgeNodeId: null,
+        baseWorkspaceVersion: null,
+        leaseUntil: '2099-12-31T23:59:59.000Z',
+        status: 'running',
+        lastHeartbeatAt: '2026-04-08T12:00:00.000Z',
+        cancelRequestedAt: null,
+        committedAt: null,
+        finishedAt: null,
+        error: null,
+        createdAt: '2026-04-08T12:00:00.000Z',
+        updatedAt: '2026-04-08T12:00:00.000Z',
+      },
+    ]);
+
+    const onCancel = vi.fn();
+    const factory = getChannelFactory('terminal');
+    const channel = factory!({
+      onMessage: vi.fn(),
+      onChatMetadata: vi.fn(),
+      onCancel,
+      registeredGroups: () => ({}),
+    });
+
+    expect(channel).not.toBeNull();
+    await channel!.connect();
+
+    process.stdin.emit('data', Buffer.from([0x1b]));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(onCancel).toHaveBeenCalledWith('terminal_canary');
+    await channel!.disconnect();
+  });
+
+  it('does not trigger onCancel when ESC is pressed while idle', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    vi.mocked(listExecutionStates).mockReturnValue([]);
+    vi.mocked(listTaskGraphs).mockReturnValue([]);
+
+    const onCancel = vi.fn();
+    const factory = getChannelFactory('terminal');
+    const channel = factory!({
+      onMessage: vi.fn(),
+      onChatMetadata: vi.fn(),
+      onCancel,
+      registeredGroups: () => ({}),
+    });
+
+    expect(channel).not.toBeNull();
+    await channel!.connect();
+
+    process.stdin.emit('data', Buffer.from([0x1b]));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(onCancel).not.toHaveBeenCalled();
+    await channel!.disconnect();
+  });
+
+  it('ignores escape sequences (arrow keys) and only responds to lone ESC', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    const onCancel = vi.fn();
+    const factory = getChannelFactory('terminal');
+    const channel = factory!({
+      onMessage: vi.fn(),
+      onChatMetadata: vi.fn(),
+      onCancel,
+      registeredGroups: () => ({}),
+    });
+
+    expect(channel).not.toBeNull();
+    await channel!.connect();
+    await channel!.setTyping?.('term:canary-group', true);
+
+    process.stdin.emit('data', Buffer.from([0x1b, 0x5b, 0x41]));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(onCancel).not.toHaveBeenCalled();
     await channel!.disconnect();
   });
 });

@@ -18,15 +18,36 @@ import { resolveGroupFolderPath } from './group-folder.js';
 
 export type WorkspaceManifest = Record<string, string>;
 
+const WORKSPACE_SNAPSHOT_EXCLUDED_DIRS = new Set([
+  'node_modules',
+  '.git',
+  'dist',
+  '.next',
+  'coverage',
+]);
+
+const WORKSPACE_SNAPSHOT_EXCLUDED_SUFFIXES = [
+  '.test.ts',
+  '.spec.ts',
+  '.test.js',
+  '.spec.js',
+  '.d.ts',
+  '.map',
+];
+
 function listFilesRecursive(root: string): string[] {
   const entries: string[] = [];
   const walk = (current: string) => {
     for (const name of fs.readdirSync(current).sort()) {
+      if (WORKSPACE_SNAPSHOT_EXCLUDED_DIRS.has(name)) continue;
       const fullPath = path.join(current, name);
       const stat = fs.statSync(fullPath);
       if (stat.isDirectory()) {
         walk(fullPath);
       } else if (stat.isFile()) {
+        if (WORKSPACE_SNAPSHOT_EXCLUDED_SUFFIXES.some((s) => name.endsWith(s))) {
+          continue;
+        }
         entries.push(path.relative(root, fullPath));
       }
     }

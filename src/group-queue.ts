@@ -14,6 +14,13 @@ interface QueuedTask {
 
 export type QueueLane = 'foreground' | 'background';
 
+export interface ResetGroupQueueOptions {
+  closeForeground?: boolean;
+  closeBackground?: boolean;
+  clearPendingMessages?: boolean;
+  clearPendingTasks?: boolean;
+}
+
 const MAX_RETRIES = 5;
 const BASE_RETRY_MS = 5000;
 
@@ -262,6 +269,34 @@ export class GroupQueue {
     } catch {
       // ignore
     }
+  }
+
+  resetGroup(groupJid: string, options: ResetGroupQueueOptions = {}): void {
+    const state = this.getGroup(groupJid);
+
+    if (options.closeForeground) {
+      this.closeStdin(groupJid, 'foreground');
+      state.foreground.idleWaiting = false;
+      state.foreground.retryScheduled = false;
+      state.foreground.retryCount = 0;
+    }
+
+    if (options.closeBackground) {
+      this.closeStdin(groupJid, 'background');
+      state.background.idleWaiting = false;
+    }
+
+    if (options.clearPendingMessages) {
+      state.pendingMessages = false;
+    }
+
+    if (options.clearPendingTasks) {
+      state.pendingTasks = [];
+    }
+
+    this.waitingGroups = this.waitingGroups.filter(
+      (entry) => entry.groupJid !== groupJid,
+    );
   }
 
   private async runForGroup(

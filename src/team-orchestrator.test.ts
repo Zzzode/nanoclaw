@@ -23,11 +23,33 @@ describe('team orchestrator', () => {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   });
 
-  it('detects numbered team roles and multiple follow-up reminders', async () => {
-    const { detectEdgeTeamPlan } = await import('./team-orchestrator.js');
+  it('uses explicit agent team trigger and planner result instead of numbered regex splitting', async () => {
+    const { detectEdgeTeamPlan, shouldUseEdgeTeamPlanner } = await import(
+      './team-orchestrator.js'
+    );
+
+    expect(
+      shouldUseEdgeTeamPlanner(
+        '请创建一个 10-agent team，并行完成 terminal edge team observability 文档审阅。1) 标题与范围，2) 前提条件，3) 固定 prompt。',
+      ),
+    ).toBe(true);
+    expect(
+      shouldUseEdgeTeamPlanner(
+        '并行完成 terminal edge team observability 文档审阅。1) 标题与范围，2) 前提条件，3) 固定 prompt。',
+      ),
+    ).toBe(false);
 
     const plan = detectEdgeTeamPlan(
       '请创建一个 3-agent team，并行完成：1) 目标与验收标准，2) 风险与失败点，3) 执行步骤与结果记录模板。最后统一汇总，并创建 2 个 follow-up task：一个 10 分钟后提醒我检查并发执行结果，一个 20 分钟后提醒我回顾风险项。',
+      {
+        shouldFanout: true,
+        teamSize: 3,
+        roles: [
+          { index: 1, title: '目标与验收标准' },
+          { index: 2, title: '风险与失败点' },
+          { index: 3, title: '执行步骤与结果记录模板' },
+        ],
+      },
       new Date('2026-04-07T08:00:00.000Z'),
     );
 
@@ -49,6 +71,22 @@ describe('team orchestrator', () => {
         scheduleValue: '2026-04-07T08:20:00.000Z',
       },
     ]);
+  });
+
+  it('returns null when planner decides not to fan out', async () => {
+    const { detectEdgeTeamPlan } = await import('./team-orchestrator.js');
+
+    expect(
+      detectEdgeTeamPlan(
+        '请创建一个 10-agent team，并行完成 terminal edge team observability 文档审阅。1) 标题与范围，2) 前提条件，3) 固定 prompt。',
+        {
+          shouldFanout: false,
+          teamSize: 10,
+          roles: [],
+          reason: '章节列表更适合单次回答，不适合 fanout。',
+        },
+      ),
+    ).toBeNull();
   });
 
   it('creates real child executions, aggregates results, and creates follow-up tasks', async () => {
@@ -108,6 +146,7 @@ describe('team orchestrator', () => {
 
     let activeChildren = 0;
     let maxConcurrentChildren = 0;
+    let plannerCalls = 0;
     const childPrompts: string[] = [];
     const edgeWorker: FrameworkWorker = {
       backendId: 'edge',
@@ -115,6 +154,22 @@ describe('team orchestrator', () => {
       runtimeClass: 'edge-subprocess',
       capabilityEnvelope: ['fs.read'],
       async run(_group, input) {
+        if (input.shadowMode) {
+          plannerCalls += 1;
+          return {
+            status: 'success',
+            result: JSON.stringify({
+              shouldFanout: true,
+              teamSize: 3,
+              roles: [
+                { title: '目标与验收标准' },
+                { title: '风险与失败点' },
+                { title: '执行步骤与结果记录模板' },
+              ],
+              reason: '用户显式请求 3-agent team，且三块工作可以并行。',
+            }),
+          };
+        }
         childPrompts.push(input.prompt);
         activeChildren += 1;
         maxConcurrentChildren = Math.max(maxConcurrentChildren, activeChildren);
@@ -145,6 +200,7 @@ describe('team orchestrator', () => {
     const aggregateTaskId = `task:${turnId}:aggregate`;
 
     expect(result).toEqual({ handled: true, status: 'success' });
+    expect(plannerCalls).toBe(1);
     expect(maxConcurrentChildren).toBeGreaterThanOrEqual(2);
     expect(onOutput).toHaveBeenCalledTimes(3);
     expect(onOutput).toHaveBeenNthCalledWith(1, {
@@ -174,8 +230,8 @@ describe('team orchestrator', () => {
       '未在当前仓库中找到对应命令（原输出包含：claw --version）',
     );
     expect(childPrompts).toHaveLength(3);
-    expect(childPrompts[0]).toContain('package.json');
-    expect(childPrompts[0]).toContain('src/channels/terminal.ts');
+    expect(childPrompts[0]).toContain('CLAUDE.md');
+    expect(childPrompts[0]).toContain('workspace.read');
     expect(childPrompts[0]).toContain('/status');
     expect(childPrompts[0]).toContain('/tasks');
     expect(childPrompts[0]).toContain('npm run build');

@@ -176,7 +176,9 @@ function buildRecentMessages(
   const planKind = input.executionContext?.planFragment?.kind;
   if (
     input.prompt.trim() &&
-    (planKind === 'edge_fanout_child' || planKind === 'edge_fanout_aggregate')
+    (planKind === 'edge_fanout_child' ||
+      planKind === 'edge_fanout_aggregate' ||
+      planKind === 'edge_team_planner')
   ) {
     return [{ role: 'user', content: input.prompt.trim() }];
   }
@@ -250,17 +252,21 @@ function buildExecutionRequest(
     groupId: group.folder,
     baseWorkspaceVersion,
   };
-  const planKind = executionContext.planFragment?.kind;
-  const allowedTools = Array.from(
-    input.shadowMode
-      ? EDGE_SHADOW_ALLOWED_TOOL_SET
-      : planKind === 'edge_fanout_child' || planKind === 'edge_fanout_aggregate'
-        ? EDGE_FANOUT_ALLOWED_TOOLS
-        : EDGE_ALLOWED_TOOL_SET,
-  );
   const maxToolCalls =
     executionContext.capabilityBudget?.maxToolCalls ??
     EDGE_DEFAULT_MAX_TOOL_CALLS;
+  const planKind = executionContext.planFragment?.kind;
+  const allowedTools =
+    maxToolCalls <= 0
+      ? []
+      : Array.from(
+          input.shadowMode
+            ? EDGE_SHADOW_ALLOWED_TOOL_SET
+            : planKind === 'edge_fanout_child' ||
+                planKind === 'edge_fanout_aggregate'
+              ? EDGE_FANOUT_ALLOWED_TOOLS
+              : EDGE_ALLOWED_TOOL_SET,
+        );
   const deadlineMs =
     executionContext.deadline?.deadlineMs ??
     group.containerConfig?.timeout ??

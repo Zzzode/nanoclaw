@@ -47,6 +47,15 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
+
+function summarizeRuntimeError(error: string | null | undefined): string {
+  const normalized = typeof error === 'string' ? error.trim() : '';
+  if (!normalized) return 'Unknown error';
+  const singleLine = normalized.replace(/\s+/g, ' ');
+  return singleLine.length <= 200
+    ? singleLine
+    : `${singleLine.slice(0, 200)}...`;
+}
 import {
   runShadowExecutionComparison,
   selectShadowExecution,
@@ -361,13 +370,14 @@ async function runTask(
     });
 
     if (recovery.kind === 'fallback' && executionId) {
+      const rawError = streamedError || output.error || 'Unknown error';
       failExecution(
         executionId,
-        streamedError || output.error || 'Unknown error',
+        rawError,
       );
       emitTerminalSystemEvent(
         task.chat_jid,
-        `执行降级：${graph.graphId} · edge → heavy · ${recovery.reason}`,
+        `执行降级：${graph.graphId} · edge → heavy · ${recovery.reason} · ${summarizeRuntimeError(rawError)}`,
       );
 
       const fallback = prepareHeavyFallbackExecution({

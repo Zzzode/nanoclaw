@@ -226,6 +226,36 @@ describe('edgeBackend', () => {
     });
   });
 
+  it('suppresses tool exposure when the execution budget allows zero tool calls', () => {
+    const request = buildExecutionRequest(group, {
+      ...input,
+      shadowMode: true,
+      executionContext: {
+        ...input.executionContext!,
+        capabilityBudget: {
+          capabilities: [],
+          maxToolCalls: 0,
+        },
+      },
+    });
+
+    expect(request.policy).toEqual({
+      allowedTools: [],
+      capabilities: [],
+      execution: {
+        allowJsExecution: false,
+        maxJsExecutions: 3,
+        allowedModuleImports: [],
+      },
+      networkProfile: 'disabled',
+    });
+    expect(request.capabilityBudget).toEqual({
+      capabilities: [],
+      maxToolCalls: 0,
+    });
+    expect(request.limits.maxToolCalls).toBe(0);
+  });
+
   it('streams output and returns the local runner final result', async () => {
     const backend = createEdgeBackend();
     expect(backend).toMatchObject({
@@ -661,6 +691,93 @@ describe('edgeBackend', () => {
         status: 'error',
         result: null,
         error: 'Edge runner produced no progress within 30000ms.',
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps long-running edge requests alive when heartbeats continue during upstream wait', async () => {
+    vi.useFakeTimers();
+
+    try {
+      const execution = beginExecution({
+        scopeType: 'group',
+        scopeId: group.folder,
+        backend: 'edge',
+        groupJid: input.chatJid,
+        now: new Date('2026-04-03T00:00:00.000Z'),
+        leaseMs: 305_000,
+      });
+
+      const backend = createEdgeBackend({
+        async *runTurn(request, options) {
+          yield {
+            type: 'ack',
+            executionId: request.executionId,
+            nodeId: 'node-heartbeat',
+          };
+
+          const startedAt = new Date('2026-04-03T00:00:00.000Z').getTime();
+          for (let index = 1; index <= 4; index += 1) {
+            await new Promise<void>((resolve, reject) => {
+              const timer = setTimeout(resolve, 10_000);
+              options?.signal?.addEventListener(
+                'abort',
+                () => {
+                  clearTimeout(timer);
+                  reject(options.signal?.reason ?? new Error('aborted'));
+                },
+                { once: true },
+              );
+            });
+
+            yield {
+              type: 'heartbeat',
+              executionId: request.executionId,
+              at: new Date(startedAt + index * 10_000).toISOString(),
+            };
+          }
+
+          yield {
+            type: 'checkpoint',
+            executionId: request.executionId,
+            providerSession: 'edge-session:group:edge-group',
+            summaryDelta: 'planner still waiting',
+            workspaceOverlayDigest: 'workspace:unchanged',
+          };
+          yield {
+            type: 'output_message',
+            executionId: request.executionId,
+            text: 'planner response after long upstream wait',
+          };
+          yield {
+            type: 'final',
+            executionId: request.executionId,
+            result: {
+              status: 'success',
+              outputText: 'planner response after long upstream wait',
+              providerSessionId: 'edge-session:group:edge-group',
+            },
+          };
+        },
+      });
+
+      const runPromise = backend.run(group, {
+        ...input,
+        executionContext: {
+          executionId: execution.executionId,
+          logicalSessionId: execution.logicalSessionId,
+          turnId: execution.turnId,
+        },
+      });
+
+      await vi.advanceTimersByTimeAsync(40_100);
+
+      await expect(runPromise).resolves.toEqual({
+        status: 'success',
+        result: 'planner response after long upstream wait',
+        newSessionId: 'edge-session:group:edge-group',
       });
     } finally {
       vi.useRealTimers();

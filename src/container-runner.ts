@@ -7,9 +7,9 @@ import fs from 'fs';
 import path from 'path';
 
 import {
-  CONTAINER_ANTHROPIC_API_KEY,
-  CONTAINER_ANTHROPIC_BASE_URL,
-  CONTAINER_ANTHROPIC_MODEL,
+  ANTHROPIC_API_KEY,
+  ANTHROPIC_BASE_URL,
+  ANTHROPIC_MODEL,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
@@ -53,12 +53,95 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  metadata?: {
+    source?: 'heavy';
+    event?: string;
+    targetKey?: string;
+    detail?: string;
+    summary?: string;
+  };
 }
 
 interface VolumeMount {
   hostPath: string;
   containerPath: string;
   readonly: boolean;
+}
+
+function parseHeavyLogLine(line: string): ContainerOutput['metadata'] | null {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith('[agent-runner]')) return null;
+  const message = trimmed.replace(/^\[agent-runner\]\s*/, '');
+  if (!message) return null;
+
+  if (message.startsWith('Starting query')) {
+    return {
+      source: 'heavy',
+      event: 'query_started',
+      targetKey: 'root',
+      detail: message,
+    };
+  }
+  if (message.startsWith('Task notification:')) {
+    const statusMatch = message.match(/status=([^\s]+)/);
+    const summaryMatch = message.match(/summary=(.+)$/);
+    return {
+      source: 'heavy',
+      event: 'task_notification',
+      targetKey: 'root',
+      detail: statusMatch ? `task status=${statusMatch[1]}` : message,
+      summary: summaryMatch?.[1]?.trim(),
+    };
+  }
+  if (message.startsWith('Query ended, waiting for next IPC message')) {
+    return {
+      source: 'heavy',
+      event: 'waiting_for_ipc',
+      targetKey: 'root',
+      detail: message,
+    };
+  }
+  if (message.startsWith('Close sentinel')) {
+    return {
+      source: 'heavy',
+      event: 'query_exit',
+      targetKey: 'root',
+      detail: message,
+    };
+  }
+  if (message.startsWith('Piping IPC message')) {
+    return {
+      source: 'heavy',
+      event: 'ipc_message_during_query',
+      targetKey: 'root',
+      detail: message,
+    };
+  }
+  if (message.startsWith('Got new message')) {
+    return {
+      source: 'heavy',
+      event: 'ipc_message_received',
+      targetKey: 'root',
+      detail: message,
+    };
+  }
+  if (message.startsWith('Session initialized:')) {
+    return {
+      source: 'heavy',
+      event: 'session_initialized',
+      targetKey: 'root',
+      detail: message,
+    };
+  }
+  if (message.startsWith('Query done.')) {
+    return {
+      source: 'heavy',
+      event: 'query_completed',
+      targetKey: 'root',
+      detail: message,
+    };
+  }
+  return null;
 }
 
 function buildVolumeMounts(
@@ -249,14 +332,14 @@ async function buildContainerArgs(
       { containerName },
       'OneCLI gateway not reachable — container will have no credentials',
     );
-    if (CONTAINER_ANTHROPIC_BASE_URL) {
-      args.push('-e', `ANTHROPIC_BASE_URL=${CONTAINER_ANTHROPIC_BASE_URL}`);
+    if (ANTHROPIC_BASE_URL) {
+      args.push('-e', `ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}`);
     }
-    if (CONTAINER_ANTHROPIC_API_KEY) {
-      args.push('-e', `ANTHROPIC_API_KEY=${CONTAINER_ANTHROPIC_API_KEY}`);
+    if (ANTHROPIC_API_KEY) {
+      args.push('-e', `ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}`);
     }
-    if (CONTAINER_ANTHROPIC_MODEL) {
-      args.push('-e', `ANTHROPIC_MODEL=${CONTAINER_ANTHROPIC_MODEL}`);
+    if (ANTHROPIC_MODEL) {
+      args.push('-e', `ANTHROPIC_MODEL=${ANTHROPIC_MODEL}`);
     }
   }
 
@@ -412,7 +495,19 @@ export async function runContainerAgent(
       const chunk = data.toString();
       const lines = chunk.trim().split('\n');
       for (const line of lines) {
-        if (line) logger.debug({ container: group.folder }, line);
+        if (line) {
+          logger.debug({ container: group.folder }, line);
+          const metadata = parseHeavyLogLine(line);
+          if (metadata && onOutput) {
+            outputChain = outputChain.then(() =>
+              onOutput({
+                status: 'success',
+                result: null,
+                metadata,
+              }),
+            );
+          }
+        }
       }
       // Don't reset timeout on stderr — SDK writes debug logs continuously.
       // Timeout only resets on actual output (OUTPUT_MARKER in stdout).

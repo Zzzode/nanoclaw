@@ -7,7 +7,9 @@ import {
   getLogicalSession,
   getTaskGraph,
   getTaskNode,
+  listExecutionStates,
   listExecutionStatesForTaskNode,
+  listTaskGraphs,
 } from './db.js';
 import {
   beginExecution,
@@ -25,6 +27,7 @@ import {
 import {
   createRootTaskGraph,
   createTaskNodeInGraph,
+  failRootTaskGraph,
   markTaskNodeRunning,
 } from './task-graph-state.js';
 
@@ -362,5 +365,178 @@ describe('execution state service', () => {
     expect(getTaskGraph('graph:expired-child')).toMatchObject({
       status: 'failed',
     });
+  });
+});
+
+describe('graceful terminal quit cleans up all running state', () => {
+  it('cancels all running executions and fails all running graphs for a terminal group', () => {
+    const terminalJid = 'term:canary-group';
+    const terminalGroupFolder = 'terminal_canary';
+    const otherJid = 'other@g.us';
+
+    createLogicalSession({
+      id: 'group:terminal_canary',
+      scopeType: 'group',
+      scopeId: terminalGroupFolder,
+      providerSessionId: null,
+      status: 'active',
+      lastTurnId: null,
+      workspaceVersion: null,
+      groupMemoryVersion: null,
+      summaryRef: null,
+      recentMessagesWindow: null,
+      createdAt: '2026-04-08T00:00:00.000Z',
+      updatedAt: '2026-04-08T00:00:00.000Z',
+    });
+
+    createRootTaskGraph({
+      graphId: 'graph:terminal-turn-1',
+      rootTaskId: 'task:terminal-turn-1:root',
+      requestKind: 'group_turn',
+      scopeType: 'group',
+      scopeId: terminalGroupFolder,
+      groupFolder: terminalGroupFolder,
+      chatJid: terminalJid,
+      logicalSessionId: 'group:terminal_canary',
+      workerClass: 'edge',
+      backendId: 'edge',
+      now: new Date('2026-04-08T00:00:00.000Z'),
+    });
+    markTaskNodeRunning('graph:terminal-turn-1', 'task:terminal-turn-1:root');
+
+    createRootTaskGraph({
+      graphId: 'graph:terminal-turn-2',
+      rootTaskId: 'task:terminal-turn-2:root',
+      requestKind: 'group_turn',
+      scopeType: 'group',
+      scopeId: terminalGroupFolder,
+      groupFolder: terminalGroupFolder,
+      chatJid: terminalJid,
+      logicalSessionId: 'group:terminal_canary',
+      workerClass: 'edge',
+      backendId: 'edge',
+      now: new Date('2026-04-08T00:00:01.000Z'),
+    });
+    markTaskNodeRunning('graph:terminal-turn-2', 'task:terminal-turn-2:root');
+
+    const termExec1 = beginExecution({
+      scopeType: 'group',
+      scopeId: terminalGroupFolder,
+      backend: 'edge',
+      groupJid: terminalJid,
+      taskNodeId: 'task:terminal-turn-1:root',
+      now: new Date('2026-04-08T00:00:00.000Z'),
+      leaseMs: 300_000,
+    });
+
+    const termExec2 = beginExecution({
+      scopeType: 'group',
+      scopeId: terminalGroupFolder,
+      backend: 'edge',
+      groupJid: terminalJid,
+      taskNodeId: 'task:terminal-turn-2:root',
+      now: new Date('2026-04-08T00:00:01.000Z'),
+      leaseMs: 300_000,
+    });
+
+    createLogicalSession({
+      id: 'group:other_group',
+      scopeType: 'group',
+      scopeId: 'other_group',
+      providerSessionId: null,
+      status: 'active',
+      lastTurnId: null,
+      workspaceVersion: null,
+      groupMemoryVersion: null,
+      summaryRef: null,
+      recentMessagesWindow: null,
+      createdAt: '2026-04-08T00:00:00.000Z',
+      updatedAt: '2026-04-08T00:00:00.000Z',
+    });
+
+    createRootTaskGraph({
+      graphId: 'graph:other-turn',
+      rootTaskId: 'task:other-turn:root',
+      requestKind: 'group_turn',
+      scopeType: 'group',
+      scopeId: 'other_group',
+      groupFolder: 'other_group',
+      chatJid: otherJid,
+      logicalSessionId: 'group:other_group',
+      workerClass: 'edge',
+      backendId: 'edge',
+      now: new Date('2026-04-08T00:00:02.000Z'),
+    });
+    markTaskNodeRunning('graph:other-turn', 'task:other-turn:root');
+
+    const otherExec = beginExecution({
+      scopeType: 'group',
+      scopeId: 'other_group',
+      backend: 'edge',
+      groupJid: otherJid,
+      taskNodeId: 'task:other-turn:root',
+      now: new Date('2026-04-08T00:00:02.000Z'),
+      leaseMs: 300_000,
+    });
+
+    const runningBefore = listExecutionStates('running');
+    expect(runningBefore).toHaveLength(3);
+    const runningGraphsBefore = listTaskGraphs('running');
+    expect(runningGraphsBefore).toHaveLength(3);
+
+    // 模拟 gracefulTerminalQuit 的核心逻辑
+    const terminalRunning = listExecutionStates('running').filter(
+      (e) => e.groupJid === terminalJid,
+    );
+    const terminalCancelRequested = listExecutionStates('cancel_requested').filter(
+      (e) => e.groupJid === terminalJid,
+    );
+    for (const execution of [...terminalRunning, ...terminalCancelRequested]) {
+      requestExecutionCancel(execution.executionId);
+    }
+    const terminalGraphs = listTaskGraphs('running').filter(
+      (g) => g.chatJid === terminalJid || g.groupFolder === terminalGroupFolder,
+    );
+    for (const graph of terminalGraphs) {
+      failRootTaskGraph(graph.graphId, graph.rootTaskId, 'Terminal session quit');
+    }
+
+    // 验证 terminal 的 execution 都被取消了
+    expect(getExecutionState(termExec1.executionId)).toMatchObject({
+      status: 'cancel_requested',
+    });
+    expect(getExecutionState(termExec2.executionId)).toMatchObject({
+      status: 'cancel_requested',
+    });
+
+    // 验证 terminal 的 graph 都被标记为 failed
+    expect(getTaskGraph('graph:terminal-turn-1')).toMatchObject({
+      status: 'failed',
+      error: 'Terminal session quit',
+    });
+    expect(getTaskGraph('graph:terminal-turn-2')).toMatchObject({
+      status: 'failed',
+      error: 'Terminal session quit',
+    });
+
+    // 验证其他 group 的 execution 和 graph 不受影响
+    expect(getExecutionState(otherExec.executionId)).toMatchObject({
+      status: 'running',
+    });
+    expect(getTaskGraph('graph:other-turn')).toMatchObject({
+      status: 'running',
+    });
+
+    // 验证 quit 后没有属于 terminal 的 running execution 残留
+    const terminalRunningAfter = listExecutionStates('running').filter(
+      (e) => e.groupJid === terminalJid,
+    );
+    expect(terminalRunningAfter).toHaveLength(0);
+
+    // 验证 quit 后没有属于 terminal 的 running graph 残留
+    const terminalRunningGraphsAfter = listTaskGraphs('running').filter(
+      (g) => g.chatJid === terminalJid || g.groupFolder === terminalGroupFolder,
+    );
+    expect(terminalRunningGraphsAfter).toHaveLength(0);
   });
 });

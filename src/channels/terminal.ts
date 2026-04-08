@@ -1,7 +1,6 @@
 import readline from 'readline';
 
 import {
-  ASSISTANT_NAME,
   EDGE_ANTHROPIC_MODEL,
   EDGE_ENABLE_TOOLS,
   EDGE_MODEL,
@@ -26,31 +25,63 @@ import {
   updateTask,
 } from '../db.js';
 import { buildFrameworkObservabilitySnapshot } from '../framework-observability.js';
+import {
+  buildTerminalPanel,
+  type TerminalPanelTranscriptEntry,
+} from '../terminal-panel.js';
+import {
+  buildTerminalActiveTurnSummary,
+  buildTerminalAgentsSummaryFromObservability,
+  buildTerminalFocusSummary,
+  buildTerminalGraphSummaryFromObservability,
+  cycleTerminalFocus,
+  resetTerminalObservability,
+  setTerminalFocus,
+} from '../terminal-observability.js';
 import { deleteScheduledTask } from '../task-control.js';
 import type { Channel } from '../types.js';
 import { formatDisplayDateTime } from '../timezone.js';
 import { registerChannel, type ChannelOpts } from './registry.js';
 
 const COLOR_DIM = '\x1b[90m';
-const COLOR_CYAN = '\x1b[36m';
-const COLOR_GREEN = '\x1b[32m';
-const COLOR_YELLOW = '\x1b[33m';
 const COLOR_RESET = '\x1b[0m';
 const TERMINAL_EVENT_LIMIT = 50;
+const TERMINAL_TRANSCRIPT_LIMIT = 80;
 const DEFAULT_LOG_TAIL = 12;
+const CLEAR_SCREEN = '\x1b[2J\x1b[H';
 
 type TerminalExecutionHealth = 'healthy' | 'missing' | 'stale' | 'terminal';
 type TerminalGraphHealth = 'healthy' | 'stale' | 'terminal' | 'idle';
+type LocalCommand =
+  | '/help'
+  | '/status'
+  | '/agents'
+  | '/graph'
+  | '/focus'
+  | '/tasks'
+  | '/task'
+  | '/new'
+  | '/session'
+  | '/logs'
+  | '/clear'
+  | '/exit'
+  | '/quit';
 
 let activeTerminalChannel: TerminalChannel | null = null;
 let terminalEvents: Array<{ at: string; text: string }> = [];
+let terminalReplies: Array<{ at: string; text: string }> = [];
+let terminalTranscript: TerminalPanelTranscriptEntry[] = [];
 
-function formatClock(date = new Date()): string {
-  return date.toLocaleTimeString('zh-CN', {
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  });
+function terminalEventTail(limit: number): string[] {
+  return terminalEvents.slice(-limit).map((entry) => entry.text);
+}
+
+function terminalReplyTail(limit: number): string[] {
+  return terminalReplies.slice(-limit).map((entry) => entry.text);
+}
+
+function terminalTranscriptTail(limit: number): TerminalPanelTranscriptEntry[] {
+  return terminalTranscript.slice(-limit);
 }
 
 function providerLabel(): string {
@@ -63,10 +94,6 @@ function modelLabel(): string {
     return EDGE_ANTHROPIC_MODEL;
   }
   return EDGE_MODEL || 'default';
-}
-
-function assistantLabel(): string {
-  return ASSISTANT_NAME.toLowerCase();
 }
 
 function terminalTaskSnapshot() {
@@ -191,14 +218,18 @@ function findLatestTerminalTeamGraph() {
     graph: { status: string };
     graphHealth: TerminalGraphHealth;
   }) => {
-    if (entry.graph.status === 'running' && entry.graphHealth === 'healthy')
+    if (entry.graph.status === 'running' && entry.graphHealth === 'healthy') {
       return 4;
-    if (entry.graph.status === 'running' && entry.graphHealth === 'idle')
+    }
+    if (entry.graph.status === 'running' && entry.graphHealth === 'idle') {
       return 3;
-    if (entry.graph.status === 'completed' || entry.graph.status === 'failed')
+    }
+    if (entry.graph.status === 'completed' || entry.graph.status === 'failed') {
       return 2;
-    if (entry.graph.status === 'running' && entry.graphHealth === 'stale')
+    }
+    if (entry.graph.status === 'running' && entry.graphHealth === 'stale') {
       return 1;
+    }
     return 0;
   };
 
@@ -214,13 +245,6 @@ function findLatestTerminalTeamGraph() {
   return sorted[0] ?? null;
 }
 
-function indentBlock(text: string): string {
-  return text
-    .split('\n')
-    .map((line) => `  ${line}`)
-    .join('\n');
-}
-
 function recordTerminalEvent(text: string): void {
   const normalized = text.trim();
   if (!normalized) return;
@@ -231,6 +255,54 @@ function recordTerminalEvent(text: string): void {
   if (terminalEvents.length > TERMINAL_EVENT_LIMIT) {
     terminalEvents = terminalEvents.slice(-TERMINAL_EVENT_LIMIT);
   }
+}
+
+function recordTerminalReply(text: string): void {
+  const normalized = text.trim();
+  if (!normalized) return;
+  terminalReplies.push({
+    at: new Date().toISOString(),
+    text: normalized,
+  });
+  if (terminalReplies.length > TERMINAL_EVENT_LIMIT) {
+    terminalReplies = terminalReplies.slice(-TERMINAL_EVENT_LIMIT);
+  }
+}
+
+function recordTerminalTranscript(
+  role: TerminalPanelTranscriptEntry['role'],
+  text: string,
+): void {
+  const normalized = text.trim();
+  if (!normalized) return;
+  const at = new Date().toISOString();
+  const previous = terminalTranscript[terminalTranscript.length - 1];
+  if (previous && previous.role === role && previous.text === normalized) {
+    previous.at = at;
+    return;
+  }
+  terminalTranscript.push({ at, role, text: normalized });
+  if (terminalTranscript.length > TERMINAL_TRANSCRIPT_LIMIT) {
+    terminalTranscript = terminalTranscript.slice(-TERMINAL_TRANSCRIPT_LIMIT);
+  }
+}
+
+function clearTerminalEventLog(): void {
+  terminalEvents = [];
+}
+
+function clearTerminalReplyLog(): void {
+  terminalReplies = [];
+}
+
+function clearTerminalTranscriptLog(): void {
+  terminalTranscript = [];
+}
+
+function shouldPromoteSystemEvent(text: string): boolean {
+  return /失败|错误|异常|降级|fallback|failed|error|timeout|stale|warning/i.test(
+    text,
+  );
 }
 
 export function buildTerminalLogsSummary(limit = DEFAULT_LOG_TAIL): string {
@@ -249,7 +321,9 @@ export function buildTerminalLogsSummary(limit = DEFAULT_LOG_TAIL): string {
 }
 
 export function resetTerminalEventLogForTests(): void {
-  terminalEvents = [];
+  clearTerminalEventLog();
+  clearTerminalReplyLog();
+  clearTerminalTranscriptLog();
 }
 
 export function appendTerminalEventForTests(text: string): void {
@@ -349,6 +423,11 @@ export function buildTerminalTasksSummary(): string {
 }
 
 export function buildTerminalAgentsSummary(): string {
+  const liveSummary = buildTerminalAgentsSummaryFromObservability();
+  if (liveSummary) {
+    return liveSummary;
+  }
+
   const selection = findLatestTerminalTeamGraph();
   if (!selection) {
     return '当前没有可观察的 edge team graph。';
@@ -389,6 +468,11 @@ export function buildTerminalAgentsSummary(): string {
 }
 
 export function buildTerminalGraphSummary(): string {
+  const liveSummary = buildTerminalGraphSummaryFromObservability();
+  if (liveSummary) {
+    return liveSummary;
+  }
+
   const selection = findLatestTerminalTeamGraph();
   if (!selection) {
     return '当前没有可观察的 edge team graph。';
@@ -434,6 +518,7 @@ export function buildTerminalStatusSummary(): string {
     `tools: ${EDGE_ENABLE_TOOLS ? 'on' : 'off'}`,
     `group: ${TERMINAL_GROUP_NAME} (${TERMINAL_GROUP_FOLDER})`,
     buildTerminalStatusLine().replace(/\x1b\[[0-9;]*m/g, ''),
+    buildTerminalActiveTurnSummary(),
     buildTerminalObservabilitySummary(),
   ].join('\n');
 }
@@ -451,27 +536,18 @@ export function buildTerminalObservabilitySummary(): string {
   ].join('\n');
 }
 
-type LocalCommand =
-  | '/help'
-  | '/status'
-  | '/agents'
-  | '/graph'
-  | '/tasks'
-  | '/task'
-  | '/new'
-  | '/session'
-  | '/logs'
-  | '/clear'
-  | '/exit'
-  | '/quit';
-
 class TerminalChannel implements Channel {
   name = 'terminal';
   private connected = false;
   private rl: readline.Interface | null = null;
   private lastAssistantMessageByJid = new Map<string, string>();
   private typingByJid = new Set<string>();
-  private lastPromptSignature: string | null = null;
+  private lastScreenSignature: string | null = null;
+  private latestSystemEvent: string | null = null;
+  private latestAssistantMessage: string | null = null;
+  private inspectorTitle: string | null = null;
+  private inspectorBody: string | null = null;
+  private stdinDataHandler: ((chunk: Buffer) => void) | null = null;
 
   constructor(private readonly opts: ChannelOpts) {}
 
@@ -492,18 +568,79 @@ class TerminalChannel implements Channel {
       terminal: true,
     });
 
-    this.renderHeader();
-    this.renderPrompt();
+    this.setupEscListener();
+    this.renderScreen(true);
 
     this.rl.on('line', (line) => {
       void this.handleLine(line);
     });
   }
 
+  private setupEscListener(): void {
+    if (!process.stdin.isTTY) return;
+
+    this.stdinDataHandler = (chunk: Buffer): void => {
+      const sequence = chunk.toString('utf8');
+      if (sequence === '\u001b[1;2A') {
+        this.handleFocusCycle(-1);
+        return;
+      }
+      if (sequence === '\u001b[1;2B') {
+        this.handleFocusCycle(1);
+        return;
+      }
+      if (chunk[0] !== 0x1b) return;
+      const isLoneEscape =
+        chunk.length === 1 || (chunk.length === 2 && chunk[1] === 0x1b);
+      if (!isLoneEscape) return;
+      void this.handleInterrupt();
+    };
+
+    process.stdin.on('data', this.stdinDataHandler);
+  }
+
+  private handleFocusCycle(direction: 1 | -1): void {
+    const next = cycleTerminalFocus(direction);
+    if (!next) return;
+    const detail = buildTerminalFocusSummary();
+    this.setInspector('focus', detail ? `focus -> ${next}\n\n${detail}` : `focus -> ${next}`);
+    this.renderScreen(true);
+  }
+
+  private async handleInterrupt(): Promise<void> {
+    const isBusy = this.typingByJid.has(TERMINAL_GROUP_JID);
+    if (!isBusy && !this.hasActiveExecutions()) {
+      return;
+    }
+    this.latestSystemEvent = '已请求打断当前执行';
+    this.setInspector('interrupt', '已请求打断当前执行。');
+    this.renderScreen(true);
+    await this.opts.onCancel?.(TERMINAL_GROUP_FOLDER);
+  }
+
+  private hasActiveExecutions(): boolean {
+    const running = listExecutionStates('running').filter(
+      (execution) => execution.groupJid === TERMINAL_GROUP_JID,
+    );
+    const cancelRequested = listExecutionStates('cancel_requested').filter(
+      (execution) => execution.groupJid === TERMINAL_GROUP_JID,
+    );
+    const runningGraphs = listTaskGraphs('running').filter(
+      (graph) =>
+        graph.chatJid === TERMINAL_GROUP_JID ||
+        graph.groupFolder === TERMINAL_GROUP_FOLDER,
+    );
+    return (
+      running.length > 0 ||
+      cancelRequested.length > 0 ||
+      runningGraphs.length > 0
+    );
+  }
+
   private async handleLine(line: string): Promise<void> {
     const text = line.trim();
     if (!text) {
-      this.renderPrompt();
+      this.renderScreen();
       return;
     }
 
@@ -513,6 +650,10 @@ class TerminalChannel implements Channel {
 
     const now = new Date().toISOString();
     this.lastAssistantMessageByJid.delete(TERMINAL_GROUP_JID);
+    this.inspectorTitle = null;
+    this.inspectorBody = null;
+    recordTerminalTranscript('user', text);
+    this.renderScreen(true);
     this.opts.onMessage(TERMINAL_GROUP_JID, {
       id: `terminal:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
       chat_jid: TERMINAL_GROUP_JID,
@@ -530,17 +671,24 @@ class TerminalChannel implements Channel {
     switch (command) {
       case '/exit':
       case '/quit':
+        resetTerminalObservability();
+        clearTerminalEventLog();
+        clearTerminalReplyLog();
+        clearTerminalTranscriptLog();
+        await this.opts.onQuit?.(TERMINAL_GROUP_FOLDER);
         await this.disconnect();
         process.exit(0);
         return true;
       case '/help':
-        this.renderLocalCommandResult(
+        this.showInspector(
+          'help',
           [
             '可用命令：',
             '/help  查看帮助',
             '/status 查看当前状态',
             '/agents 查看当前 team agents 状态',
             '/graph 查看当前 team graph 明细',
+            '/focus <root|planner|worker N|aggregate|clear> 切换观察焦点',
             '/tasks  查看当前任务',
             '/task list 查看任务详情',
             '/task pause <taskId> 暂停任务',
@@ -549,22 +697,38 @@ class TerminalChannel implements Channel {
             '/new  清空当前 terminal provider session',
             '/session clear 清空当前 terminal provider session',
             '/logs [n] 查看最近系统事件',
-            '/clear  清空当前界面',
+            '/clear  清空当前 inspector',
+            'Shift+Up/Down 切换当前 focus agent',
+            'ESC    打断当前正在执行的对话',
             '/quit   退出终端',
           ].join('\n'),
         );
         return true;
       case '/status':
-        this.renderLocalCommandResult(buildTerminalStatusSummary());
+        this.showInspector('status', buildTerminalStatusSummary());
         return true;
       case '/agents':
-        this.renderLocalCommandResult(buildTerminalAgentsSummary());
+        this.showInspector('agents', buildTerminalAgentsSummary());
         return true;
       case '/graph':
-        this.renderLocalCommandResult(buildTerminalGraphSummary());
+        this.showInspector('graph', buildTerminalGraphSummary());
         return true;
+      case '/focus': {
+        const target = parts.slice(1).join(' ').trim();
+        if (!target) {
+          this.showInspector(
+            'focus',
+            '用法：/focus <root|planner|worker N|aggregate|clear>',
+          );
+          return true;
+        }
+        const result = setTerminalFocus(target);
+        const detail = buildTerminalFocusSummary();
+        this.showInspector('focus', detail ? `${result}\n\n${detail}` : result);
+        return true;
+      }
       case '/tasks':
-        this.renderLocalCommandResult(buildTerminalTasksSummary());
+        this.showInspector('tasks', buildTerminalTasksSummary());
         return true;
       case '/task':
         await this.handleTaskCommand(parts.slice(1));
@@ -577,17 +741,16 @@ class TerminalChannel implements Channel {
         return true;
       case '/logs': {
         const count = Number.parseInt(parts[1] || '', 10);
-        this.renderLocalCommandResult(
-          buildTerminalLogsSummary(
-            Number.isNaN(count) ? DEFAULT_LOG_TAIL : count,
-          ),
+        this.showInspector(
+          'logs',
+          buildTerminalLogsSummary(Number.isNaN(count) ? DEFAULT_LOG_TAIL : count),
         );
         return true;
       }
       case '/clear':
-        console.clear();
-        this.renderHeader();
-        this.renderPrompt();
+        this.inspectorTitle = null;
+        this.inspectorBody = null;
+        this.renderScreen(true);
         return true;
       default:
         return false;
@@ -595,80 +758,69 @@ class TerminalChannel implements Channel {
   }
 
   private async handleTaskCommand(args: string[]): Promise<void> {
-    this.renderLocalCommandResult(executeTerminalTaskCommand(args));
+    this.showInspector('task', executeTerminalTaskCommand(args));
   }
 
   private async handleSessionCommand(args: string[]): Promise<void> {
     const action = args[0];
     if (!action || (action !== 'clear' && action !== 'new')) {
-      this.renderLocalCommandResult('用法：/session <clear>');
+      this.showInspector('session', '用法：/session <clear>');
       return;
     }
 
     await this.opts.onResetSession?.(TERMINAL_GROUP_FOLDER);
     this.lastAssistantMessageByJid.delete(TERMINAL_GROUP_JID);
-    this.renderLocalCommandResult(
+    this.latestAssistantMessage = null;
+    this.latestSystemEvent = '已清空当前 terminal provider session';
+    resetTerminalObservability();
+    clearTerminalEventLog();
+    clearTerminalReplyLog();
+    clearTerminalTranscriptLog();
+    this.showInspector(
+      'session',
       '已清空当前 terminal provider session。下一条消息将从新会话开始。',
     );
   }
 
-  private renderHeader(): void {
-    process.stdout.write(
-      [
-        '',
-        `${COLOR_CYAN}NanoClaw Edge Canary${COLOR_RESET}`,
-        `${COLOR_DIM}聊天优先 · 少量系统事件 · /help 查看命令${COLOR_RESET}`,
-        '',
-      ].join('\n'),
-    );
+  private buildScreenText(): string {
+    const busy = this.typingByJid.has(TERMINAL_GROUP_JID);
+    const inputPrompt = busy ? '… ' : 'you> ';
+    const panel = buildTerminalPanel({
+      statusLine: buildTerminalStatusLine(),
+      busy,
+      latestSystemEvent: this.latestSystemEvent,
+      latestAssistantMessage: this.latestAssistantMessage,
+      recentSystemEvents: terminalEventTail(4),
+      recentReplies: terminalReplyTail(4),
+      recentTranscript: terminalTranscriptTail(12),
+      inspectorTitle: this.inspectorTitle,
+      inspectorBody: this.inspectorBody,
+    });
+    return `${panel}\n${inputPrompt}`;
   }
 
-  private renderPrompt(): void {
+  private renderScreen(force = false): void {
     if (!this.rl) return;
-    const busy = this.typingByJid.has(TERMINAL_GROUP_JID);
-    const prompt = busy
-      ? `${buildTerminalStatusLine()}\n… `
-      : `${buildTerminalStatusLine()}\nyou> `;
-    if (this.lastPromptSignature === prompt) {
+    const screen = this.buildScreenText();
+    if (!force && this.lastScreenSignature === screen) {
       return;
     }
-    this.lastPromptSignature = prompt;
-    this.rl.setPrompt(prompt);
+    this.lastScreenSignature = screen;
+    this.rl.pause();
+    process.stdout.write(`${CLEAR_SCREEN}${screen}`);
+    this.rl.setPrompt('');
+    this.rl.resume();
     this.rl.prompt(true);
   }
 
-  private writeBlock(label: string, text: string, color = COLOR_RESET): void {
-    const normalized = text.replace(/\r\n/g, '\n').trimEnd();
-    if (this.rl) {
-      this.rl.pause();
-    }
-    if (!normalized.includes('\n')) {
-      process.stdout.write(`\n${color}${label} ${normalized}${COLOR_RESET}\n`);
-      this.rl?.resume();
-      return;
-    }
-    process.stdout.write(
-      `\n${color}${label}${COLOR_RESET}\n${indentBlock(normalized)}\n`,
-    );
-    this.rl?.resume();
+  private setInspector(title: string, body: string): void {
+    this.inspectorTitle = title;
+    this.inspectorBody = body;
   }
 
-  private invalidatePrompt(): void {
-    this.lastPromptSignature = null;
-  }
-
-  private renderAssistantMessage(text: string): void {
-    this.writeBlock(`${assistantLabel()}>`, text, COLOR_GREEN);
-  }
-
-  private renderSystemMessage(text: string): void {
-    this.writeBlock(`system [${formatClock()}]`, text, COLOR_YELLOW);
-  }
-
-  private renderLocalCommandResult(text: string): void {
-    this.renderSystemMessage(text);
-    this.invalidatePrompt();
-    this.renderPrompt();
+  private showInspector(title: string, body: string): void {
+    this.setInspector(title, body);
+    this.renderScreen(true);
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
@@ -676,24 +828,33 @@ class TerminalChannel implements Channel {
     const normalized = text.trim();
     if (!normalized) return;
     if (this.lastAssistantMessageByJid.get(jid) === normalized) return;
+
     this.lastAssistantMessageByJid.set(jid, normalized);
-    this.renderAssistantMessage(normalized);
-    if (!this.typingByJid.has(jid)) {
-      this.invalidatePrompt();
-      this.renderPrompt();
+    recordTerminalReply(normalized);
+    recordTerminalTranscript('assistant', normalized);
+    this.latestAssistantMessage = normalized;
+    if (this.typingByJid.has(jid)) {
+      this.typingByJid.delete(jid);
     }
+    this.renderScreen(true);
   }
 
   sendSystemEvent(jid: string, text: string): void {
     if (!this.ownsJid(jid)) return;
     const normalized = text.trim();
     if (!normalized) return;
+
     recordTerminalEvent(normalized);
-    this.renderSystemMessage(normalized);
-    if (!this.typingByJid.has(jid)) {
-      this.invalidatePrompt();
-      this.renderPrompt();
+    recordTerminalTranscript('system', normalized);
+    this.latestSystemEvent = normalized;
+    if (shouldPromoteSystemEvent(normalized)) {
+      const focus = buildTerminalFocusSummary();
+      this.setInspector(
+        'system',
+        focus ? `${normalized}\n\n${focus}` : normalized,
+      );
     }
+    this.renderScreen(true);
   }
 
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
@@ -702,16 +863,14 @@ class TerminalChannel implements Channel {
     if (isTyping) {
       if (this.typingByJid.has(jid)) return;
       this.typingByJid.add(jid);
-      this.invalidatePrompt();
-      this.renderSystemMessage('处理中…');
-      this.renderPrompt();
+      this.latestSystemEvent = '处理中…';
+      this.renderScreen(true);
       return;
     }
 
     if (!this.typingByJid.has(jid)) return;
     this.typingByJid.delete(jid);
-    this.invalidatePrompt();
-    this.renderPrompt();
+    this.renderScreen(true);
   }
 
   isConnected(): boolean {
@@ -726,9 +885,19 @@ class TerminalChannel implements Channel {
     this.connected = false;
     this.lastAssistantMessageByJid.clear();
     this.typingByJid.clear();
-    this.lastPromptSignature = null;
+    this.lastScreenSignature = null;
+    this.latestSystemEvent = null;
+    this.latestAssistantMessage = null;
+    this.inspectorTitle = null;
+    this.inspectorBody = null;
+    clearTerminalReplyLog();
+    clearTerminalTranscriptLog();
     if (activeTerminalChannel === this) {
       activeTerminalChannel = null;
+    }
+    if (this.stdinDataHandler) {
+      process.stdin.removeListener('data', this.stdinDataHandler);
+      this.stdinDataHandler = null;
     }
     this.rl?.close();
     this.rl = null;

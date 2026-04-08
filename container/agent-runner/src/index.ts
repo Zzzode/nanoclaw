@@ -40,6 +40,13 @@ interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  metadata?: {
+    source?: 'heavy';
+    event?: string;
+    targetKey?: string;
+    detail?: string;
+    summary?: string;
+  };
 }
 
 interface SessionEntry {
@@ -125,6 +132,25 @@ function writeOutput(output: ContainerOutput): void {
 
 function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
+}
+
+function emitProgress(
+  event: string,
+  detail?: string,
+  summary?: string,
+  targetKey = 'root',
+): void {
+  writeOutput({
+    status: 'success',
+    result: null,
+    metadata: {
+      source: 'heavy',
+      event,
+      targetKey,
+      detail,
+      summary,
+    },
+  });
 }
 
 function getSessionSummary(
@@ -393,6 +419,7 @@ async function runQuery(
     if (!ipcPolling) return;
     if (shouldClose()) {
       log('Close sentinel detected during query, ending stream');
+      emitProgress('close_during_query', 'close sentinel detected during active query');
       closedDuringQuery = true;
       stream.end();
       ipcPolling = false;
@@ -401,6 +428,7 @@ async function runQuery(
     const messages = drainIpcInput();
     for (const text of messages) {
       log(`Piping IPC message into active query (${text.length} chars)`);
+      emitProgress('ipc_message_during_query', `piped IPC message (${text.length} chars)`);
       stream.push(text);
     }
     setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
@@ -506,6 +534,7 @@ async function runQuery(
     if (message.type === 'system' && message.subtype === 'init') {
       newSessionId = message.session_id;
       log(`Session initialized: ${newSessionId}`);
+      emitProgress('session_initialized', `session initialized: ${newSessionId}`);
     }
 
     if (
@@ -519,6 +548,11 @@ async function runQuery(
       };
       log(
         `Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`,
+      );
+      emitProgress(
+        'task_notification',
+        `task=${tn.task_id} status=${tn.status}`,
+        tn.summary,
       );
     }
 
@@ -540,6 +574,11 @@ async function runQuery(
   ipcPolling = false;
   log(
     `Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`,
+  );
+  emitProgress(
+    'query_completed',
+    `messages=${messageCount} results=${resultCount} closedDuringQuery=${closedDuringQuery}`,
+    lastAssistantUuid,
   );
   return { newSessionId, lastAssistantUuid, closedDuringQuery };
 }
@@ -678,6 +717,10 @@ async function main(): Promise<void> {
       log(
         `Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`,
       );
+      emitProgress(
+        'query_started',
+        `session=${sessionId || 'new'} resumeAt=${resumeAt || 'latest'}`,
+      );
 
       const queryResult = await runQuery(
         prompt,
@@ -699,6 +742,7 @@ async function main(): Promise<void> {
       // idle timer and cause a 30-min delay before the next _close).
       if (queryResult.closedDuringQuery) {
         log('Close sentinel consumed during query, exiting');
+        emitProgress('query_exit', 'close sentinel consumed during query');
         break;
       }
 
@@ -706,15 +750,18 @@ async function main(): Promise<void> {
       writeOutput({ status: 'success', result: null, newSessionId: sessionId });
 
       log('Query ended, waiting for next IPC message...');
+      emitProgress('waiting_for_ipc', 'query ended, waiting for next IPC message');
 
       // Wait for the next message or _close sentinel
       const nextMessage = await waitForIpcMessage();
       if (nextMessage === null) {
         log('Close sentinel received, exiting');
+        emitProgress('query_exit', 'close sentinel received while idle');
         break;
       }
 
       log(`Got new message (${nextMessage.length} chars), starting new query`);
+      emitProgress('ipc_message_received', `received follow-up message (${nextMessage.length} chars)`);
       prompt = nextMessage;
     }
   } catch (err) {

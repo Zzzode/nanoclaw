@@ -515,15 +515,24 @@ function buildAnthropicSystemPrompt(request: ExecutionRequest): string {
   if (request.promptPackage.summary) {
     sections.push(`Conversation summary:\n${request.promptPackage.summary}`);
   }
+  const toolGuidance =
+    request.limits.maxToolCalls > 0
+      ? [
+          'Use tools only when they materially help.',
+          'When tools are available, call them via the provider tool/function-calling API.',
+          'If the user explicitly asks for a specific tool by name, honor that exact tool unless it is unavailable or unsafe.',
+          'Do not emit pseudo tool syntax like <tool_call> or textual tool requests.',
+          `Maximum tool calls for this turn: ${request.limits.maxToolCalls}.`,
+        ]
+      : [
+          'No tools are available for this turn. Do not attempt to call tools.',
+          'Focus on reasoning and producing the requested output directly.',
+        ];
   sections.push(
     [
       'You are running inside NanoClaw Edge mode.',
       'Be concise and helpful.',
-      'Use tools only when they materially help.',
-      'When tools are available, call them via the provider tool/function-calling API.',
-      'If the user explicitly asks for a specific tool by name, honor that exact tool unless it is unavailable or unsafe.',
-      'Do not emit pseudo tool syntax like <tool_call> or textual tool requests.',
-      `Maximum tool calls for this turn: ${request.limits.maxToolCalls}.`,
+      ...toolGuidance,
       `Workspace base version: ${request.workspace.baseVersion}.`,
       `Network profile for tools: ${request.policy.networkProfile}.`,
     ].join('\n'),
@@ -602,6 +611,43 @@ async function edgeFetchText(
     url: result.url,
     text: async () => result.body,
   };
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function* withHeartbeatWhilePending<T>(options: {
+  executionId: string;
+  signal?: AbortSignal;
+  run: () => Promise<T>;
+  intervalMs?: number;
+}): AsyncGenerator<ExecutionEvent, T> {
+  const intervalMs = options.intervalMs ?? 10_000;
+  const taggedRun = options.run().then((value) => ({ kind: 'result', value }));
+
+  while (true) {
+    const next = (await Promise.race([
+      taggedRun,
+      delay(intervalMs).then(() => ({ kind: 'heartbeat' as const })),
+    ])) as
+      | { kind: 'result'; value: T }
+      | { kind: 'heartbeat' };
+
+    if (next.kind === 'result') {
+      return next.value;
+    }
+
+    if (options.signal?.aborted) {
+      continue;
+    }
+
+    yield {
+      type: 'heartbeat',
+      executionId: options.executionId,
+      at: new Date().toISOString(),
+    };
+  }
 }
 
 async function executeTool(
@@ -883,21 +929,26 @@ class AnthropicEdgeRunner implements EdgeRunner {
         EDGE_ANTHROPIC_API_BASE_URL ||
         'https://api.anthropic.com'
       ).replace(/\/+$/, '');
-      const response = await fetch(`${baseUrl}/v1/messages`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'anthropic-version': '2023-06-01',
-          'x-api-key': apiKey,
-        },
-        body: JSON.stringify({
-          model: request.runner?.model || EDGE_ANTHROPIC_MODEL,
-          max_tokens: 1024,
-          system: buildAnthropicSystemPrompt(request),
-          messages,
-          ...(tools.length > 0 ? { tools } : {}),
-        }),
+      const response = yield* withHeartbeatWhilePending({
+        executionId: request.executionId,
         signal,
+        run: () =>
+          fetch(`${baseUrl}/v1/messages`, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'anthropic-version': '2023-06-01',
+              'x-api-key': apiKey,
+            },
+            body: JSON.stringify({
+              model: request.runner?.model || EDGE_ANTHROPIC_MODEL,
+              max_tokens: 1024,
+              system: buildAnthropicSystemPrompt(request),
+              messages,
+              ...(tools.length > 0 ? { tools } : {}),
+            }),
+            signal,
+          }),
       });
 
       if (!response.ok) {
@@ -1158,23 +1209,28 @@ class OpenAiCompatibleEdgeRunner implements EdgeRunner {
         'https://api.openai.com/v1'
       ).replace(/\/+$/, '');
       const model = request.runner?.model || EDGE_MODEL || 'gpt-4o-mini';
-      const response = await edgeFetchText(`${baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          messages,
-          ...(tools.length > 0
-            ? {
-                tools,
-                tool_choice: 'auto',
-              }
-            : {}),
-        }),
+      const response = yield* withHeartbeatWhilePending({
+        executionId: request.executionId,
         signal,
+        run: () =>
+          edgeFetchText(`${baseUrl}/chat/completions`, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              authorization: `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify({
+              model,
+              messages,
+              ...(tools.length > 0
+                ? {
+                    tools,
+                    tool_choice: 'auto',
+                  }
+                : {}),
+            }),
+            signal,
+          }),
       });
 
       if (!response.ok) {
